@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>墨家兄弟 · 跨时空守护者</title>
+<style>
+  body { margin:0; background:#2c3e50; color:#fff; font-family:"PingFang SC","Microsoft YaHei",sans-serif; text-align:center;
+         user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+  h1 { margin:12px 0 2px; font-size:22px; }
+  p.tip { margin:0 0 8px; color:#bdc3c7; font-size:13px; }
+  #hud { font-size:15px; margin:6px 0; }
+  #hud span { color:#ffd54f; }
+  canvas { background:#2c3e50; border:4px solid #5d4037; border-radius:8px; max-width:100%; height:auto; touch-action:none; }
+  .keys { margin-top:8px; font-size:13px; color:#ecf0f1; }
+  .keys b { color:#ffd54f; }
+  .bar { margin:10px 0 4px; }
+  .bar button { font-family:inherit; font-size:13px; padding:6px 14px; margin:0 4px; border:none; border-radius:6px; cursor:pointer; color:#fff; background:#3498db; }
+  .bar button.reset { background:#e74c3c; }
+  .bar button:hover { opacity:.88; }
+  .saved { color:#2ecc71; font-size:12px; height:16px; margin-bottom:14px; }
+  #story { position:fixed; inset:0; background:rgba(18,20,28,0.93); display:flex; align-items:center; justify-content:center; z-index:10; }
+  .storybox { max-width:540px; margin:16px; padding:28px 32px; background:#1c2533; border:2px solid #5d4037; border-radius:14px; }
+  .storybox h2 { color:#ffd54f; margin:0 0 14px; }
+  .storybox p { line-height:1.95; color:#ecf0f1; font-size:15px; }
+  .storybox .sm { font-size:12px; color:#95a5a6; margin-top:10px; }
+  #startBtn { margin-top:14px; font-family:inherit; font-size:17px; padding:11px 30px; border:none; border-radius:9px; background:#e74c3c; color:#fff; cursor:pointer; }
+  #startBtn:hover { opacity:.9; }
+</style>
+</head>
+<body>
+  <h1>墨家兄弟 · 跨时空守护者</h1>
+  <p class="tip">里程碑 1.4：手机 / 平板可玩了（触屏摇杆 + 大招按钮）。</p>
+  <div id="hud">🎯 守住村庄　💎 <span id="count">0</span>/<span id="total">0</span>　⚔️ <span id="kills">0</span>　🌊 第 <span id="wave">0</span> 波</div>
+  <canvas id="game" width="800" height="500"></canvas>
+  <div id="keyHelp">
+    <div class="keys"><span style="color:#e74c3c">● 墨白</span> 移动 <b>WASD</b>　大招 <b>Q</b>（地狱之火）　|　<span style="color:#3498db">● 墨霖</span> 移动 <b>↑↓←→</b>　大招 <b>Enter</b>（念力锁链）</div>
+    <div class="keys" style="color:#95a5a6">开火已自动——靠近敌人自动射击，你只管走位和放大招</div>
+  </div>
+  <div id="touchHelp" class="keys" style="display:none;color:#95a5a6">📱 左半屏拖动＝墨白移动，右半屏拖动＝墨霖移动；点左下 / 右下「大招」按钮放绝技（建议横屏）</div>
+  <div class="bar">
+    <button id="btnExport">⬇ 导出存档</button>
+    <button id="btnImport">⬆ 导入存档</button>
+    <button id="btnReset" class="reset">↺ 重新开始</button>
+    <input id="fileInput" type="file" accept="application/json" style="display:none">
+  </div>
+  <div class="saved" id="savedHint"></div>
+
+  <div id="story">
+    <div class="storybox">
+      <h2>第一章 · 村庄危机</h2>
+      <p>公元 1940 年，华北。一道时空裂隙撕开夜空——<br>
+      墨家兄弟 <b style="color:#e74c3c">墨白</b> 与 <b style="color:#3498db">墨霖</b>，被卷回这片战火中的土地。<br>
+      侵略者正围攻村庄，乡亲危在旦夕！<br><br>
+      哥哥墨白主攻、弟弟墨霖远射——<br>
+      「守住村子！」这是他们跨越时空的第一战。</p>
+      <button id="startBtn">▶ 开始守卫</button>
+      <div class="sm">📱 手机 / 平板建议横屏游玩</div>
+    </div>
+  </div>
+
+<script>
+const FONT='"PingFang SC","Microsoft YaHei",sans-serif';
+const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
+const W=canvas.width, H=canvas.height;
+const R=16, CR=11, SAVE_KEY='mojia_save_v1';
+const ENEMY_SPEED=1.15, ENEMY_HP=50, TOUCH_DMG=8, TOUCH_CD=40, PLAYER_HP=100, ENERGY_PER_KILL=18;
+let started=false;
+
+const players=[
+  { name:'墨白', color:'#e74c3c', x:300,y:280, speed:3, pop:0, hp:PLAYER_HP, maxHp:PLAYER_HP, energy:0,
+    atkCd:0, hurtCd:0, down:0, flash:0, facing:0, walkPhase:0, moving:false, recoil:0, muzzle:0,
+    ult:'q', keys:{up:'w',down:'s',left:'a',right:'d'},
+    weapon:{type:'shotgun', pellets:5, spread:0.5, dmg:14, cd:30, speed:6.5, bulletLife:32} },
+  { name:'墨霖', color:'#3498db', x:500,y:280, speed:3, pop:0, hp:PLAYER_HP, maxHp:PLAYER_HP, energy:0,
+    atkCd:0, hurtCd:0, down:0, flash:0, facing:0, walkPhase:0, moving:false, recoil:0, muzzle:0,
+    ult:'enter', keys:{up:'arrowup',down:'arrowdown',left:'arrowleft',right:'arrowright'},
+    weapon:{type:'rifle', pierce:true, dmg:30, cd:14, speed:9, bulletLife:80} },
+];
+const houses=[{x:80,y:80},{x:640,y:90},{x:120,y:370},{x:660,y:390}];
+const trees =[{x:400,y:60},{x:230,y:230},{x:560,y:250},{x:380,y:430}];
+const CRYSTAL_POS=[{x:250,y:150},{x:400,y:130},{x:550,y:160},{x:220,y:300},{x:420,y:300},{x:600,y:300},{x:320,y:440},{x:500,y:440}];
+let crystals=CRYSTAL_POS.map((p,i)=>({id:i,x:p.x,y:p.y,collected:false}));
+let collectedCount=0, kills=0, wave=0, waveCooldown=60, enemyId=0;
+let enemies=[], bullets=[], particles=[], floaters=[], chains=[], shake=0, ultText=null;
+
+// ===================== 存档 =====================
+const SaveManager={
+  save(){ const data={version:1, players:players.map(p=>({x:Math.round(p.x),y:Math.round(p.y)})), crystals:crystals.map(c=>c.collected), kills, savedAt:Date.now()};
+    try{ localStorage.setItem(SAVE_KEY,JSON.stringify(data)); }catch(e){ console.warn('存档失败：',e); } },
+  load(){ try{ const r=localStorage.getItem(SAVE_KEY); return r?JSON.parse(r):null; }catch(e){ return null; } },
+  apply(data){ if(!data)return;
+    if(Array.isArray(data.players)) data.players.forEach((s,i)=>{ if(players[i]){players[i].x=s.x;players[i].y=s.y;} });
+    if(Array.isArray(data.crystals)) data.crystals.forEach((col,i)=>{ if(crystals[i]) crystals[i].collected=col; });
+    if(typeof data.kills==='number') kills=data.kills; },
+  reset(){ try{ localStorage.removeItem(SAVE_KEY); }catch(e){} },
+  exportFile(){ const raw=localStorage.getItem(SAVE_KEY)||JSON.stringify({version:1,players:players.map(p=>({x:p.x,y:p.y})),crystals:crystals.map(c=>c.collected),kills});
+    const blob=new Blob([raw],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='mojia_save.json'; a.click(); URL.revokeObjectURL(a.href); },
+  importFile(file){ const rd=new FileReader(); rd.onload=()=>{ try{ const d=JSON.parse(rd.result); this.apply(d); recount(); this.save(); updateHud(); flashSaved(); alert('存档导入成功！'); }catch(e){ alert('导入失败：文件格式不对'); } }; rd.readAsText(file); }
+};
+
+// ===================== 输入：键盘 =====================
+const pressed={}; const norm=k=>k.toLowerCase();
+window.addEventListener('keydown',e=>{ pressed[norm(e.key)]=true; if(e.key==='/'||e.key==='Enter'||e.key.startsWith('Arrow')) e.preventDefault(); });
+window.addEventListener('keyup',  e=>{ pressed[norm(e.key)]=false; });
+
+// ===================== 输入：触屏（双人：左半屏=墨白，右半屏=墨霖） =====================
+const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints>0);
+const touchMove=[null,null], touchUlt=[false,false], activeTouch={};
+const ultBtns=[{x:64,y:H-46,r:40,i:0,color:'#e74c3c'},{x:W-64,y:H-46,r:40,i:1,color:'#3498db'}];
+function canvasPos(t){ const r=canvas.getBoundingClientRect(); return {x:(t.clientX-r.left)*(W/r.width), y:(t.clientY-r.top)*(H/r.height)}; }
+function onTouchStart(e){ e.preventDefault(); for(const t of e.changedTouches){ const p=canvasPos(t); let onBtn=false;
+  for(const b of ultBtns){ if((p.x-b.x)**2+(p.y-b.y)**2<b.r*b.r){ touchUlt[b.i]=true; activeTouch[t.identifier]={kind:'ult',i:b.i}; onBtn=true; break; } }
+  if(onBtn) continue;
+  const i=p.x<W/2?0:1; activeTouch[t.identifier]={kind:'move',i,ox:p.x,oy:p.y,cx:p.x,cy:p.y}; touchMove[i]={mx:0,my:0};
+}}
+function onTouchMove(e){ e.preventDefault(); for(const t of e.changedTouches){ const a=activeTouch[t.identifier]; if(!a||a.kind!=='move')continue; const p=canvasPos(t); a.cx=p.x; a.cy=p.y;
+  const dx=p.x-a.ox, dy=p.y-a.oy, L=Math.hypot(dx,dy), max=55;
+  if(L>0){ const m=Math.min(L,max)/max; touchMove[a.i]={mx:dx/L*m, my:dy/L*m}; } else touchMove[a.i]={mx:0,my:0};
+}}
+function onTouchEnd(e){ e.preventDefault(); for(const t of e.changedTouches){ const a=activeTouch[t.identifier]; if(!a)continue; if(a.kind==='move') touchMove[a.i]=null; else touchUlt[a.i]=false; delete activeTouch[t.identifier]; } }
+canvas.addEventListener('touchstart',onTouchStart,{passive:false});
+canvas.addEventListener('touchmove',onTouchMove,{passive:false});
+canvas.addEventListener('touchend',onTouchEnd,{passive:false});
+canvas.addEventListener('touchcancel',onTouchEnd,{passive:false});
+
+// ===================== 音效 =====================
+let audioCtx=null;
+function ensureAudio(){ audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)(); if(audioCtx.state==='suspended') audioCtx.resume(); return audioCtx; }
+function tone(f,start,dur,vol,type){ const o=audioCtx.createOscillator(),g=audioCtx.createGain(); o.connect(g);g.connect(audioCtx.destination); o.type=type||'triangle'; o.frequency.value=f; g.gain.setValueAtTime(0.0001,start); g.gain.exponentialRampToValueAtTime(vol,start+0.02); g.gain.exponentialRampToValueAtTime(0.0001,start+dur); o.start(start); o.stop(start+dur+0.02); }
+function slide(f1,f2,start,dur,vol,type){ const o=audioCtx.createOscillator(),g=audioCtx.createGain(); o.connect(g);g.connect(audioCtx.destination); o.type=type||'square'; o.frequency.setValueAtTime(f1,start); o.frequency.exponentialRampToValueAtTime(f2,start+dur); g.gain.setValueAtTime(vol,start); g.gain.exponentialRampToValueAtTime(0.001,start+dur); o.start(start); o.stop(start+dur+0.02); }
+function playCollect(){ try{ensureAudio(); const n=audioCtx.currentTime; [660,880,1320].forEach((f,i)=>tone(f,n+i*0.05,0.18,0.2));}catch(e){} }
+function playWin(){ try{ensureAudio(); const n=audioCtx.currentTime; [523,659,784,1047].forEach((f,i)=>tone(f,n+i*0.12,0.4,0.22));}catch(e){} }
+function playShoot(type){ try{ensureAudio(); if(type==='shotgun') slide(220,55,audioCtx.currentTime,0.14,0.13,'square'); else slide(380,150,audioCtx.currentTime,0.07,0.09,'square'); }catch(e){} }
+function playHit(){ try{ensureAudio(); tone(520,audioCtx.currentTime,0.05,0.11,'triangle');}catch(e){} }
+function playExplode(){ try{ensureAudio(); slide(180,40,audioCtx.currentTime,0.32,0.2,'sawtooth');}catch(e){} }
+function playHurt(){ try{ensureAudio(); slide(220,70,audioCtx.currentTime,0.18,0.16,'square');}catch(e){} }
+function playUlt(){ try{ensureAudio(); const n=audioCtx.currentTime; [392,523,659,784,1047].forEach((f,i)=>tone(f,n+i*0.05,0.3,0.2)); slide(120,500,n,0.4,0.18,'sawtooth'); }catch(e){} }
+
+// ===================== 特效 =====================
+function burst(x,y,count,colors,power){ for(let i=0;i<count;i++){ const a=Math.random()*Math.PI*2, sp=power*(0.4+Math.random());
+  particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-1,life:24+Math.random()*14,max:40,size:2+Math.random()*3,color:colors[Math.floor(Math.random()*colors.length)]}); } }
+function spawnFloater(x,y,text,color){ floaters.push({x,y,text,color:color||'#fff59d',life:50,max:50}); }
+function addShake(n){ shake=Math.max(shake,n); }
+function showUltText(t,c){ ultText={text:t,color:c,life:60,max:60}; }
+
+// ===================== 收集 =====================
+function recount(){ collectedCount=crystals.filter(c=>c.collected).length; }
+function collect(c,p){ c.collected=true; collectedCount++;
+  burst(c.x,c.y,16,['#ffd54f','#fff59d'],3.5); spawnFloater(c.x,c.y-12,'+1'); addShake(5); p.pop=1; playCollect();
+  updateHud(); SaveManager.save(); flashSaved();
+  if(collectedCount===crystals.length){ addShake(14); burst(W/2,H/2,30,['#ffd54f','#fff59d'],4); playWin(); } }
+
+// ===================== 战斗 =====================
+function nearestEnemy(p){ let b=null,bd=1e9; for(const e of enemies){ if(e.dead)continue; const d=(e.x-p.x)**2+(e.y-p.y)**2; if(d<bd){bd=d;b=e;} } return b; }
+function nearestPlayer(e){ let b=null,bd=1e9; for(const p of players){ if(p.down>0)continue; const d=(p.x-e.x)**2+(p.y-e.y)**2; if(d<bd){bd=d;b=p;} } return b; }
+function spawnWave(n){ for(let i=0;i<n;i++){ let x,y; const s=Math.floor(Math.random()*4);
+  if(s===0){x=Math.random()*W;y=-20;} else if(s===1){x=Math.random()*W;y=H+20;} else if(s===2){x=-20;y=Math.random()*H;} else {x=W+20;y=Math.random()*H;}
+  enemies.push({id:enemyId++,x,y,hp:ENEMY_HP,maxHp:ENEMY_HP,flash:0,kx:0,ky:0,dead:false}); } }
+function fireBullet(p,a,wpn){ bullets.push({x:p.x+Math.cos(a)*16, y:p.y+Math.sin(a)*16, vx:Math.cos(a)*wpn.speed, vy:Math.sin(a)*wpn.speed,
+  owner:p.color, dmg:wpn.dmg, pierce:!!wpn.pierce, hitIds:wpn.pierce?new Set():null, life:wpn.bulletLife}); }
+function attack(p){ const e=nearestEnemy(p); if(!e) return; const wpn=p.weapon;
+  p.atkCd=wpn.cd; p.recoil=4; p.muzzle=5; playShoot(wpn.type);
+  const base=Math.atan2(e.y-p.y,e.x-p.x);
+  if(wpn.type==='shotgun'){ const step=wpn.spread/(wpn.pellets-1||1); for(let i=0;i<wpn.pellets;i++) fireBullet(p, base+(i-(wpn.pellets-1)/2)*step, wpn); }
+  else fireBullet(p, base, wpn); }
+function ult(p){
+  p.energy=0; p.recoil=6;
+  if(p.name==='墨白'){
+    showUltText('地狱之火','#ff5722'); addShake(16); playUlt();
+    for(let k=0;k<72;k++){ const a=Math.random()*Math.PI*2, sp=2+Math.random()*5;
+      particles.push({x:p.x,y:p.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-1,life:30+Math.random()*22,max:52,size:3+Math.random()*4,color:['#ff5722','#ff9800','#ffeb3b','#f44336'][Math.floor(Math.random()*4)]}); }
+    for(const e of enemies){ if(e.dead)continue; const dx=e.x-p.x,dy=e.y-p.y; if(dx*dx+dy*dy<180*180){ const a=Math.atan2(dy,dx); e.kx=Math.cos(a)*8; e.ky=Math.sin(a)*8; hitEnemy(e,{dmg:75,vx:Math.cos(a),vy:Math.sin(a),owner:null}); } }
+  } else {
+    showUltText('念力锁链','#b388ff'); addShake(12); playUlt();
+    for(const e of enemies){ if(e.dead)continue; const dx=e.x-p.x,dy=e.y-p.y; if(dx*dx+dy*dy<230*230){
+      chains.push({x1:p.x,y1:p.y,x2:e.x,y2:e.y,life:26,max:26});
+      const a=Math.atan2(p.y-e.y,p.x-e.x); e.kx=Math.cos(a)*11; e.ky=Math.sin(a)*11;
+      hitEnemy(e,{dmg:55,vx:-Math.cos(a),vy:-Math.sin(a),owner:null}); } }
+  }
+}
+function hitEnemy(e,b){ if(e.dead)return; e.hp-=b.dmg; e.flash=6;
+  const a=Math.atan2(b.vy,b.vx); e.kx=Math.cos(a)*4; e.ky=Math.sin(a)*4;
+  spawnFloater(e.x,e.y-10,'-'+b.dmg,'#fff'); burst(b.x,b.y,5,['#ffffff','#ffd54f'],2.4); addShake(3); playHit();
+  if(e.hp<=0){ e.dead=true; kills++; const killer=players.find(pp=>pp.color===b.owner); if(killer) killer.energy=Math.min(100,killer.energy+ENERGY_PER_KILL);
+    burst(e.x,e.y,22,['#ff7043','#ffa726','#ffeb3b'],4); addShake(6); playExplode(); updateHud(); SaveManager.save(); } }
+function hurtPlayer(p,e){ p.hp-=TOUCH_DMG; p.hurtCd=TOUCH_CD; p.flash=10; addShake(4); playHurt();
+  const a=Math.atan2(p.y-e.y,p.x-e.x); p.x+=Math.cos(a)*8; p.y+=Math.sin(a)*8;
+  if(p.hp<=0){ p.hp=0; p.down=120; burst(p.x,p.y,22,['#e74c3c','#ff7043','#fff'],4); } }
+
+function update(){
+  for(let idx=0; idx<players.length; idx++){
+    const p=players[idx];
+    if(p.atkCd>0)p.atkCd--; if(p.hurtCd>0)p.hurtCd--; if(p.flash>0)p.flash--; if(p.muzzle>0)p.muzzle--;
+    p.pop*=0.85; p.recoil*=0.8;
+    if(p.down>0){ p.down--; if(p.down===0)p.hp=p.maxHp; p.moving=false; continue; }
+    const k=p.keys; let mx=0,my=0;
+    if(pressed[k.up])my-=1; if(pressed[k.down])my+=1; if(pressed[k.left])mx-=1; if(pressed[k.right])mx+=1;
+    const tm=touchMove[idx]; if(tm){ mx+=tm.mx; my+=tm.my; }
+    if(mx||my){ const L=Math.hypot(mx,my); if(L>1){ mx/=L; my/=L; } }
+    p.moving=(mx!==0||my!==0);
+    p.x=Math.max(R,Math.min(W-R,p.x+mx*p.speed)); p.y=Math.max(R,Math.min(H-R,p.y+my*p.speed));
+    if(p.moving) p.walkPhase+=0.3;
+    const ne=nearestEnemy(p);
+    if(ne) p.facing=Math.atan2(ne.y-p.y,ne.x-p.x); else if(p.moving) p.facing=Math.atan2(my,mx);
+    if(p.atkCd<=0 && ne) attack(p);
+    if((pressed[p.ult]||touchUlt[idx]) && p.energy>=100) ult(p);
+    for(const c of crystals){ if(c.collected)continue; const dx=p.x-c.x,dy=p.y-c.y; if(dx*dx+dy*dy<(R+CR)*(R+CR)) collect(c,p); }
+  }
+  for(let i=bullets.length-1;i>=0;i--){ const b=bullets[i]; b.x+=b.vx; b.y+=b.vy; b.life--; let gone=false;
+    for(const e of enemies){ if(e.dead)continue; if(b.pierce&&b.hitIds.has(e.id))continue;
+      const dx=b.x-e.x,dy=b.y-e.y; if(dx*dx+dy*dy<18*18){ hitEnemy(e,b); if(b.pierce) b.hitIds.add(e.id); else {gone=true;break;} } }
+    if(gone||b.life<=0||b.x<-30||b.x>W+30||b.y<-30||b.y>H+30) bullets.splice(i,1); }
+  for(let i=enemies.length-1;i>=0;i--){ const e=enemies[i]; if(e.flash>0)e.flash--;
+    e.x+=e.kx; e.y+=e.ky; e.kx*=0.8; e.ky*=0.8;
+    const tp=nearestPlayer(e);
+    if(tp){ const a=Math.atan2(tp.y-e.y,tp.x-e.x); e.x+=Math.cos(a)*ENEMY_SPEED; e.y+=Math.sin(a)*ENEMY_SPEED;
+      const dx=tp.x-e.x,dy=tp.y-e.y; if(dx*dx+dy*dy<(R+14)*(R+14) && tp.hurtCd<=0 && tp.down<=0) hurtPlayer(tp,e); }
+    if(e.dead||e.hp<=0) enemies.splice(i,1); }
+  if(enemies.length===0){ if(waveCooldown>0) waveCooldown--; else { wave++; spawnWave(2+wave); updateHud(); } } else waveCooldown=120;
+  for(let i=particles.length-1;i>=0;i--){ const q=particles[i]; q.x+=q.vx; q.y+=q.vy; q.vy+=0.12; q.life--; if(q.life<=0)particles.splice(i,1); }
+  for(let i=floaters.length-1;i>=0;i--){ const f=floaters[i]; f.y-=0.7; f.life--; if(f.life<=0)floaters.splice(i,1); }
+  for(let i=chains.length-1;i>=0;i--){ chains[i].life--; if(chains[i].life<=0)chains.splice(i,1); }
+  if(ultText){ ultText.life--; if(ultText.life<=0) ultText=null; }
+  shake*=0.88; if(shake<0.5)shake=0;
+}
+
+// ===================== 渲染 =====================
+function drawHouse(x,y){ ctx.fillStyle='#d7a86e'; ctx.fillRect(x,y,70,50); ctx.fillStyle='#8d6e63'; ctx.beginPath(); ctx.moveTo(x-6,y); ctx.lineTo(x+35,y-28); ctx.lineTo(x+76,y); ctx.closePath(); ctx.fill(); ctx.fillStyle='#5d4037'; ctx.fillRect(x+28,y+24,16,26); }
+function drawTree(x,y){ ctx.fillStyle='#5d4037'; ctx.fillRect(x-4,y,8,18); ctx.fillStyle='#388e3c'; ctx.beginPath(); ctx.arc(x,y-4,16,0,Math.PI*2); ctx.fill(); }
+function drawCrystal(c,t){ const s=11*(1+0.18*Math.sin(t/220+c.id)); ctx.save(); ctx.translate(c.x,c.y); ctx.shadowColor='#fff176'; ctx.shadowBlur=12; ctx.fillStyle='#ffd54f'; ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(0,-s); ctx.lineTo(s*0.7,0); ctx.lineTo(0,s); ctx.lineTo(-s*0.7,0); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore(); }
+function drawBullet(b){ ctx.fillStyle=b.owner; ctx.beginPath(); ctx.arc(b.x,b.y,b.pierce?5:4,0,Math.PI*2); ctx.fill(); ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.beginPath(); ctx.arc(b.x,b.y,2,0,Math.PI*2); ctx.fill(); }
+function drawEnemy(e,t){ const wob=Math.sin(t/120+e.id)*0.12; ctx.save(); ctx.translate(e.x,e.y); ctx.rotate(wob);
+  ctx.fillStyle=e.flash>0?'#fff':'#616161'; ctx.fillRect(-13,-13,26,26); ctx.fillStyle=e.flash>0?'#fff':'#37474f'; ctx.fillRect(-13,-17,26,6);
+  ctx.fillStyle=e.flash>0?'#fff':'#cfa27a'; ctx.beginPath(); ctx.arc(0,-2,5,0,Math.PI*2); ctx.fill(); ctx.restore();
+  const w=26,hp=Math.max(0,e.hp/e.maxHp); ctx.fillStyle='#000'; ctx.fillRect(e.x-w/2,e.y-26,w,4); ctx.fillStyle='#e74c3c'; ctx.fillRect(e.x-w/2,e.y-26,w*hp,4); }
+function drawChain(ch){ ctx.globalAlpha=ch.life/ch.max; ctx.strokeStyle='#b388ff'; ctx.lineWidth=3; ctx.setLineDash([5,5]); ctx.beginPath(); ctx.moveTo(ch.x1,ch.y1); ctx.lineTo(ch.x2,ch.y2); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1; }
+function drawPlayer(p){
+  ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.facing); ctx.translate(-(p.recoil||0),0);
+  let col=p.color; if(p.down>0)col='#888'; else if(p.flash>0&&Math.floor(p.flash/2)%2===0)col='#fff';
+  const r=11*(1+0.3*(p.pop||0));
+  if(p.energy>=100 && p.down<=0){ ctx.strokeStyle='#ffd54f'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(0,0,r+5+Math.sin(p.walkPhase*2)*1.5,0,Math.PI*2); ctx.stroke(); }
+  const sw=p.moving?Math.sin(p.walkPhase)*4:0;
+  ctx.strokeStyle='#4e342e'; ctx.lineWidth=4; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(0,-6); ctx.lineTo(sw,-10); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 6); ctx.lineTo(-sw,10); ctx.stroke();
+  ctx.strokeStyle=col; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(2,4); ctx.lineTo(14,3); ctx.stroke();
+  ctx.strokeStyle='#222'; ctx.lineWidth=4; ctx.beginPath(); ctx.moveTo(10,3); ctx.lineTo(22,3); ctx.stroke();
+  if(p.muzzle>0){ ctx.fillStyle='#fff59d'; ctx.beginPath(); ctx.arc(24,3,3+p.muzzle,0,Math.PI*2); ctx.fill(); }
+  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle='#fff'; ctx.stroke();
+  ctx.fillStyle='#f1c27d'; ctx.beginPath(); ctx.arc(4,0,5,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle='#fff'; ctx.font=`13px ${FONT}`; ctx.textAlign='center'; ctx.fillText(p.down>0?p.name+'（倒下）':p.name, p.x, p.y-28);
+  const w=30; ctx.fillStyle='#000'; ctx.fillRect(p.x-w/2,p.y-24,w,4); ctx.fillStyle='#2ecc71'; ctx.fillRect(p.x-w/2,p.y-24,w*Math.max(0,p.hp/p.maxHp),4);
+  ctx.fillStyle='#000'; ctx.fillRect(p.x-w/2,p.y-19,w,3); ctx.fillStyle=p.energy>=100?'#ffd54f':'#f39c12'; ctx.fillRect(p.x-w/2,p.y-19,w*Math.min(1,p.energy/100),3);
+}
+function drawTouchControls(){
+  for(const b of ultBtns){ const ready=players[b.i].energy>=100;
+    ctx.globalAlpha=0.8; ctx.fillStyle=ready?b.color:'rgba(70,70,70,0.6)'; ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1; ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#fff'; ctx.font=`bold 15px ${FONT}`; ctx.textAlign='center'; ctx.fillText('大招',b.x,b.y+5); }
+  for(const id in activeTouch){ const a=activeTouch[id]; if(a.kind!=='move')continue;
+    ctx.globalAlpha=0.25; ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(a.ox,a.oy,46,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=0.55; ctx.beginPath(); ctx.arc(a.cx,a.cy,22,0,Math.PI*2); ctx.fill(); ctx.globalAlpha=1; }
+}
+function draw(t){
+  ctx.save(); if(shake) ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);
+  ctx.fillStyle='#7cb342'; ctx.fillRect(-20,-20,W+40,H+40);
+  ctx.fillStyle='#c8a165'; ctx.fillRect(W/2-30,-20,60,H+40); ctx.fillRect(-20,H/2-30,W+40,60);
+  houses.forEach(h=>drawHouse(h.x,h.y)); trees.forEach(tr=>drawTree(tr.x,tr.y));
+  crystals.forEach(c=>{ if(!c.collected) drawCrystal(c,t); });
+  chains.forEach(drawChain);
+  bullets.forEach(drawBullet); enemies.forEach(e=>drawEnemy(e,t));
+  for(const q of particles){ ctx.globalAlpha=Math.max(0,q.life/q.max); ctx.fillStyle=q.color; ctx.fillRect(q.x-q.size/2,q.y-q.size/2,q.size,q.size); } ctx.globalAlpha=1;
+  ctx.font=`bold 18px ${FONT}`; ctx.textAlign='center';
+  for(const f of floaters){ ctx.globalAlpha=Math.max(0,f.life/f.max); ctx.fillStyle=f.color; ctx.fillText(f.text,f.x,f.y); } ctx.globalAlpha=1;
+  players.forEach(drawPlayer);
+  ctx.restore();
+  if(isTouch) drawTouchControls();
+  if(ultText){ ctx.save(); ctx.globalAlpha=Math.min(1,ultText.life/15); ctx.font=`bold 48px ${FONT}`; ctx.textAlign='center';
+    ctx.lineWidth=6; ctx.strokeStyle='#000'; ctx.strokeText(ultText.text,W/2,H/2-30); ctx.fillStyle=ultText.color; ctx.fillText(ultText.text,W/2,H/2-30); ctx.restore(); }
+}
+
+// ===================== HUD / 按钮 =====================
+const elCount=document.getElementById('count'), elTotal=document.getElementById('total'), elKills=document.getElementById('kills'), elWave=document.getElementById('wave'), elSaved=document.getElementById('savedHint');
+function updateHud(){ elCount.textContent=collectedCount; elTotal.textContent=crystals.length; elKills.textContent=kills; elWave.textContent=wave; }
+let savedTimer=null;
+function flashSaved(){ elSaved.textContent='✓ 已自动保存'; clearTimeout(savedTimer); savedTimer=setTimeout(()=>elSaved.textContent='',1200); }
+document.getElementById('btnExport').onclick=()=>SaveManager.exportFile();
+document.getElementById('btnImport').onclick=()=>document.getElementById('fileInput').click();
+document.getElementById('fileInput').onchange=e=>{ if(e.target.files[0]) SaveManager.importFile(e.target.files[0]); e.target.value=''; };
+document.getElementById('btnReset').onclick=()=>{ if(confirm('确定重新开始吗？当前进度会清空。')){ SaveManager.reset(); location.reload(); } };
+document.getElementById('startBtn').onclick=()=>{ document.getElementById('story').style.display='none'; started=true; ensureAudio(); };
+if(isTouch){ document.getElementById('keyHelp').style.display='none'; document.getElementById('touchHelp').style.display='block'; }
+setInterval(()=>SaveManager.save(),3000);
+window.addEventListener('beforeunload',()=>SaveManager.save());
+
+// ===================== 启动 =====================
+SaveManager.apply(SaveManager.load()); recount(); updateHud();
+function loop(t){ if(started) update(); draw(t); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
