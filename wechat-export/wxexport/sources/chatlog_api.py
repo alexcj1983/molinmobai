@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,6 +57,21 @@ _RECORD_TYPES = {"2": "[图片]", "3": "[语音]", "4": "[视频]", "5": "[链�
                  "8": "[文件]", "17": "[聊天记录]", "19": "[小程序]"}
 _SIMPLE_TYPES = {3: "[图片]", 34: "[语音]", 42: "[名片]", 43: "[视频]", 47: "[表情]", 50: "[语音通话]"}
 _RECORD_LIMIT = 200
+_TRANSFER = re.compile(r"^\[转账\|([^\]]*)\](?:\(([^)]*)\))?$")
+
+
+def _members_name(users, names: dict[str, str]) -> str:
+    """没起名的群，按微信的习惯用前几个成员的名字拼一个。"""
+    picked = []
+    for u in users or []:
+        if isinstance(u, dict):
+            uid = _str(u.get("userName"))
+            n = _str(u.get("displayName")) or names.get(uid, "")
+            if n:
+                picked.append(n)
+    if not picked:
+        return ""
+    return "、".join(picked[:3]) + ("等" if len(picked) > 3 else "")
 
 
 def record_items(info) -> list[str]:
@@ -116,7 +133,10 @@ def render_content(mtype: int, sub: int, content: str, contents) -> tuple[str, l
         return _join("[视频号直播]", title), []
     if sub == 92:
         return _join("[音乐]", title, url), []
-    if sub == 2000:
+    if sub == 2000:  # chatlog给的是「[转账|发送 ￥200.00](备注)」，拆开写，免得备注被当成链接地址
+        m = _TRANSFER.match(content.strip())
+        if m:
+            return _join("[转账]", m.group(1).strip(), f"备注：{m.group(2)}" if m.group(2) else ""), []
         return content or "[转账]", []
     if sub == 2001:
         return "[红包]", []
@@ -145,7 +165,7 @@ def convert_message(raw: dict, chat_id: str | None, tz: tzinfo, self_ids: Iterab
         sender = _str(raw.get("senderName")) or sender_id or "未知"
 
     text, details = render_content(mtype, sub, content, contents)
-    quote_sender = quote = ""
+    quote_sender = quote = r_id = ""
     refer = contents.get("refer") if isinstance(contents, dict) and mtype == 49 and sub == 57 else None
     if isinstance(refer, dict):
         r_id = _str(refer.get("sender"))
@@ -165,6 +185,7 @@ def convert_message(raw: dict, chat_id: str | None, tz: tzinfo, self_ids: Iterab
         seq=_int(raw.get("seq")),
         sender_id=sender_id,
         quote_sender=quote_sender,
+        quote_sender_id=r_id,
         quote=quote,
         details=details,
     )
@@ -181,6 +202,7 @@ class ChatlogAPISource(Source):
         self._names: dict[str, str] | None = None
         self._sessions: list[dict] | None = None
         self._data_start: datetime | None | bool = False  # False表示还没探测
+        self._learned_self: set[str] = set()
 
     # ---- HTTP ----
 
@@ -198,6 +220,8 @@ class ChatlogAPISource(Source):
             raise SourceError(f"连不上{self.base_url}（{e.reason}）。数据接口服务开着吗？") from None
         except (TimeoutError, ConnectionError) as e:
             raise SourceError(f"{self.base_url}没响应（{e}）。可以在配置里调大source.timeout") from None
+        except http.client.HTTPException as e:  # 响应读到一半断开（IncompleteRead等）
+            raise SourceError(f"{path}的响应中途断开（{type(e).__name__}），请重试") from None
         try:
             return json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -232,7 +256,8 @@ class ChatlogAPISource(Source):
             for r in self._items("/api/v1/chatroom"):
                 rid = _str(r.get("name"))
                 if rid:
-                    names[rid] = _str(r.get("remark")) or _str(r.get("nickName")) or names.get(rid, "")
+                    names[rid] = (_str(r.get("remark")) or _str(r.get("nickName")) or names.get(rid, "")
+                                  or _members_name(r.get("users"), names))
             self._names = names
         return self._names
 
@@ -241,7 +266,8 @@ class ChatlogAPISource(Source):
         chats = []
         for s in self._load_sessions():
             cid = _str(s.get("userName"))
-            name = names.get(cid) or _str(s.get("nickName")) or cid
+            # 微信4.x的会话列表里，群的nickName是最后一个发言人，不能拿来当群名
+            name = names.get(cid) or ("" if is_group_id(cid) else _str(s.get("nickName"))) or cid
             chats.append(Chat(cid, name, is_group_id(cid), parse_time(s.get("nTime"), self.tz)))
         return chats
 
@@ -263,7 +289,8 @@ class ChatlogAPISource(Source):
                                                   "format": "json", "limit": 1})
                 except _NoData:
                     continue
-                result = datetime(year, 1, 1, tzinfo=self.tz)
+                # 往前留一个月余量：归档时区比chatlog电脑的时区偏西时，年初头几个小时也能取到
+                result = datetime(year - 1, 12, 1, tzinfo=self.tz)
                 break
         self._data_start = result
         return result
@@ -284,18 +311,31 @@ class ChatlogAPISource(Source):
                 })
             except _NoData:
                 raw_list = []
-            # Go的空切片会序列化成null
-            for raw in raw_list or []:
+            # 相邻窗口放宽的那一天会重复取到，按seq去重。没有seq的（如Mac版微信3.x）按「同一秒、同一人、
+            # 同样内容在本窗口里第几次出现」去重，同一秒连发的几张图不会被合并成一张。
+            occurrence: dict = {}
+            for raw in raw_list or []:  # Go的空切片会序列化成null
                 if not isinstance(raw, dict):
                     continue
                 msg = convert_message(raw, chat.id, self.tz, self.self_ids)
                 if msg is None or not (start <= msg.time < end):
                     continue
-                key = msg.seq or (msg.time, msg.sender_id, msg.text)
-                if key in seen:  # 相邻窗口放宽的那一天会重复取到
+                if msg.seq:
+                    key = msg.seq
+                else:
+                    base = (msg.time, msg.sender_id, msg.text)
+                    occurrence[base] = occurrence.get(base, 0) + 1
+                    key = (*base, occurrence[base])
+                if key in seen:
                     continue
                 seen.add(key)
                 out.append(msg)
             win_start = win_end
+        # chatlog不给被引用消息标isSelf：用本批里自己发过的消息认出自己的ID
+        self._learned_self |= {m.sender_id for m in out if m.is_self and m.sender_id}
+        mine = self.self_ids | self._learned_self
+        for m in out:
+            if m.quote_sender_id and m.quote_sender_id in mine:
+                m.quote_sender = "我"
         out.sort(key=lambda m: (m.time, m.seq))
         return out

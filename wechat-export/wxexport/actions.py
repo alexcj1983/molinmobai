@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
 from itertools import groupby
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from .fsutil import read_text, write_if_changed
-from .model import Chat, Message, day_heading, parse_time
+from .model import Chat, Message, day_heading, one_line, parse_time
 from .obsidian import VaultWriter, escape_inline
 from .privacy import mask as mask_text
 from .sources import Source
@@ -28,7 +29,9 @@ MAX_TOKENS = 64000
 KINDS = ("待办", "承诺", "决定")
 LEVELS = ("高", "中", "低")
 UNSET = "未明确"
+NOTHING = "无实质内容"
 ACTIONS_DIR = "行动项"
+MAX_FAILURES = 3  # 同一段记录连续失败几次后跳过，免得每次都重发、窗口越拖越长
 
 RULES = """你在帮用户整理微信聊天记录里的行动项。用户就是记录里的「我」。
 
@@ -52,10 +55,10 @@ JSON_NOTE = """
 
 MANUAL_NOTE = """
 输出格式：按会话分节。每节先写一行「要点：……」，再逐条列出：
-- [ ] 事项 📅 YYYY-MM-DD（没有截止期就不写 📅 和日期）
+- [ ] 事项 📅 YYYY-MM-DD（没有截止期就不写📅和日期）
     - 类型 · 责任方：… · 截止：… · 置信度：…
     - 原话：「…」（消息编号）
-「决定」类不加 [ ]，放在每节最后。"""
+「决定」类不加[ ]，放在每节最后。"""
 
 RESULT_SCHEMA = {
     "type": "object",
@@ -86,7 +89,7 @@ RESULT_SCHEMA = {
 
 
 class ExtractError(Exception):
-    """单个会话处理失败（被拒、输出异常等），其他会话照常。"""
+    """单个会话处理失败（被拒、断线、输出异常等），其他会话照常。"""
 
 
 class FatalAPIError(Exception):
@@ -103,6 +106,7 @@ class Item:
     quote: str
     source_ids: list[str]
     confidence: str
+    quote_ok: bool = True  # 原话能在所引消息里找到
 
 
 @dataclass
@@ -112,6 +116,26 @@ class ChatActions:
     items: list[Item] = field(default_factory=list)
     refs: dict[str, Message] = field(default_factory=dict)  # 消息编号 → 消息
     error: str = ""
+    fatal: bool = False                     # 因致命错误或中断没跑，不算这个会话自己的失败
+    done: Message | None = None             # 成功处理到的最后一条
+    failed_chunk: list[Message] | None = None
+    skipped_note: str = ""                  # 连续失败后跳过的说明
+
+
+@dataclass
+class Batch:
+    """一个会话这次要处理的消息。"""
+    chat: Chat
+    msgs: list[Message]
+    start: datetime
+    advance: bool = True                    # 处理完是否推进日常进度
+
+
+@dataclass
+class ActionsResult:
+    path: Path | None = None
+    processed: int = 0
+    failed: int = 0
 
 
 def system_prompt(context: str, manual: bool = False) -> str:
@@ -121,23 +145,46 @@ def system_prompt(context: str, manual: bool = False) -> str:
 
 # ---- 整理聊天记录 ----
 
+_PLACEHOLDER = re.compile(r"\[[^\[\]\s]+\]")
 
-def build_transcript(msgs: list[Message], tz: tzinfo, *, mask: bool, start_index: int = 1) -> tuple[str, dict[str, Message]]:
-    """一条消息一行，前面带编号，按天分隔。返回 (文本, 编号→消息)。"""
+
+def _clean(s: str) -> str:
+    """尖括号和「[m数字」换成全角：聊天内容伪造不出记录边界，也伪造不出消息编号。"""
+    return re.sub(r"\[(?=[mM]\d)", "［", s.replace("<", "＜").replace(">", "＞"))
+
+
+def _speaker(m: Message) -> str:
+    name = _clean(m.sender)
+    if not m.is_self and name in ("我", "我方"):  # 有人把群昵称设成了「我」
+        return f"{name}（群成员昵称）"
+    return name
+
+
+def _is_placeholder(m: Message) -> bool:
+    return not m.quote and not m.details and bool(_PLACEHOLDER.fullmatch(m.text.strip()))
+
+
+def build_transcript(msgs: list[Message], tz: tzinfo, *, mask: bool,
+                     start_index: int = 1) -> tuple[str, dict[str, Message], dict[str, str]]:
+    """一条消息一行，前面带编号，按天分隔。返回 (文本, 编号→消息, 编号→发出去的那段正文)。"""
     lines: list[str] = []
     refs: dict[str, Message] = {}
+    texts: dict[str, str] = {}
+    hide = mask_text if mask else (lambda s: s)
     for day, items in groupby(msgs, key=lambda m: m.time.astimezone(tz).date()):
         lines.append(f"--- {day_heading(day)} ---")
         for m in items:
             ref = f"m{start_index + len(refs)}"
             refs[ref] = m
-            text = " ⏎ ".join(ln.strip() for ln in m.text.splitlines() if ln.strip()) or "[空]"
+            body = " ⏎ ".join(_clean(ln.strip()) for ln in m.text.splitlines() if ln.strip()) or "[空]"
             if m.quote:
-                text += f"（引用{m.quote_sender}：{m.quote}）"
-            lines.append(f"[{ref}] {m.time.astimezone(tz):%H:%M} {m.sender}：{text}")
-            lines += [f"    | {d}" for d in m.details]
-    out = "\n".join(lines)
-    return (mask_text(out) if mask else out), refs
+                body += f"（引用 {_clean(m.quote_sender)}：{_clean(m.quote)}）"
+            body = hide(body)
+            details = [hide(f"    | {_clean(d)}") for d in m.details]
+            texts[ref] = " ".join([body, *details])
+            lines.append(f"[{ref}] {m.time.astimezone(tz):%H:%M} {hide(_speaker(m))}：{body}")
+            lines += details
+    return "\n".join(lines), refs, texts
 
 
 def chunk_messages(msgs: list[Message], max_chars: int) -> list[list[Message]]:
@@ -157,13 +204,19 @@ def chunk_messages(msgs: list[Message], max_chars: int) -> list[list[Message]]:
     return chunks
 
 
-def build_user_prompt(chat: Chat, transcript: str, start: datetime, end: datetime, now: datetime, tz: tzinfo) -> str:
+def _chat_name(chat: Chat, mask: bool) -> str:
+    name = _clean(chat.name)
+    return mask_text(name) if mask else name
+
+
+def build_user_prompt(chat: Chat, transcript: str, start: datetime, end: datetime, now: datetime, tz: tzinfo,
+                      *, mask: bool = False) -> str:
     tz_name = getattr(tz, "key", str(tz))
     return (
-        f"会话：{chat.name}（{chat.kind}）\n"
+        f"会话：{_chat_name(chat, mask)}（{chat.kind}）\n"
         f"时间范围：{start.astimezone(tz):%Y-%m-%d %H:%M}至{end.astimezone(tz):%Y-%m-%d %H:%M}（{tz_name}）\n"
         f"今天：{day_heading(now.astimezone(tz).date())}\n\n"
-        "下面是聊天记录。每条前面的 [m数字] 是消息编号；「我」是用户本人。\n\n"
+        "下面是聊天记录。每条前面的[m数字]是消息编号；「我」是用户本人。\n\n"
         f"<chat_log>\n{transcript}\n</chat_log>"
     )
 
@@ -176,7 +229,12 @@ class ClaudeExtractor:
         if client is None:
             import anthropic
 
-            client = anthropic.Anthropic(max_retries=3)
+            try:
+                client = anthropic.Anthropic(max_retries=3)
+            except ImportError as e:  # 环境变量里是SOCKS代理、又没装socksio
+                raise FatalAPIError(
+                    f"创建Claude客户端失败：{e}。用SOCKS代理的话先装socksio（pip install socksio），或改用http://开头的代理"
+                ) from None
         self.client = client
         self.model = model
         self.effort = effort
@@ -187,6 +245,7 @@ class ClaudeExtractor:
 
     def extract(self, user_prompt: str) -> dict:
         import anthropic
+        import httpx2
 
         try:
             # 记录可能很长，用流式请求避免HTTP超时；只要最终结果
@@ -205,9 +264,11 @@ class ClaudeExtractor:
             ) as stream:
                 msg = stream.get_final_message()
         except anthropic.AuthenticationError:
-            raise FatalAPIError("Claude API密钥无效或没设置（环境变量ANTHROPIC_API_KEY）") from None
+            raise FatalAPIError("Claude API密钥无效（环境变量ANTHROPIC_API_KEY）") from None
         except anthropic.PermissionDeniedError as e:
-            raise FatalAPIError(f"这个API密钥没有权限：{e.message}") from None
+            raise FatalAPIError(
+                f"没有权限（HTTP 403）：{e.message}。先检查API密钥；在中国大陆走代理时，也可能是代理节点所在地区不受支持"
+            ) from None
         except anthropic.NotFoundError as e:
             raise FatalAPIError(f"模型不存在或不可用：{e.message}（检查ai.model）") from None
         except anthropic.RateLimitError:
@@ -218,62 +279,118 @@ class ClaudeExtractor:
             raise ExtractError(f"API出错（HTTP {e.status_code}）：{e.message}") from None
         except anthropic.APIConnectionError:
             raise FatalAPIError(
-                "连不上Claude API。在中国大陆需要设置代理环境变量HTTPS_PROXY，见README「网络」一节"
+                "连不上Claude API或超时。在中国大陆需要设置代理环境变量HTTPS_PROXY，见README「网络」一节"
             ) from None
+        except httpx2.TransportError as e:  # 流读到一半断线，SDK不会包装也不会重试
+            raise ExtractError(f"网络中断（{type(e).__name__}），下次运行会重试") from None
+        except TypeError as e:
+            if "authentication" in str(e):  # 一个密钥都没找到时SDK抛的是TypeError
+                raise FatalAPIError("没有找到Claude API密钥：设置环境变量ANTHROPIC_API_KEY（或先用ant auth login登录）") from None
+            raise
 
         usage = getattr(msg, "usage", None)
+        rounds = getattr(usage, "iterations", None) or [usage]  # 换过模型时，每一轮都算钱
         with self._lock:
-            self.input_tokens += getattr(usage, "input_tokens", 0) or 0
-            self.output_tokens += getattr(usage, "output_tokens", 0) or 0
+            for u in rounds:
+                self.input_tokens += getattr(u, "input_tokens", 0) or 0
+                self.output_tokens += getattr(u, "output_tokens", 0) or 0
 
-        if msg.stop_reason == "refusal":
-            category = getattr(getattr(msg, "stop_details", None), "category", None)
-            raise ExtractError(f"Claude拒绝处理这段记录（{category or '未说明类别'}）")
-        if msg.stop_reason == "max_tokens":
+        stop_reason = getattr(msg, "stop_reason", None)
+        if stop_reason == "refusal":
+            details = getattr(msg, "stop_details", None)
+            category = getattr(details, "category", None)
+            recommended = getattr(details, "recommended_model", None)
+            hint = f"，可以稍后重试（推荐模型{recommended}）" if recommended else ""
+            raise ExtractError(f"Claude拒绝处理这段记录（{category or '未说明类别'}）{hint}")
+        if stop_reason == "max_tokens":
             raise ExtractError("输出超长被截断，可以调小ai.max_chars_per_request后重跑")
+        if stop_reason == "model_context_window_exceeded":
+            raise ExtractError("这段记录超出了模型能读的长度，调小ai.max_chars_per_request后重跑")
+        if stop_reason not in ("end_turn", "stop_sequence"):
+            raise ExtractError(f"Claude异常结束（{stop_reason}）")
+
         blocks = list(msg.content)
-        # 中途换了模型时，最后一个fallback块之前的是被放弃的半截输出
+        # 中途换了模型时会有fallback块：通常取它后面的完整输出；如果服务端是让新模型接着半截往下写，
+        # 那就得把前后拼起来。两种都试
         cut = max((i for i, b in enumerate(blocks) if b.type == "fallback"), default=-1)
-        text = "".join(b.text for b in blocks[cut + 1:] if b.type == "text")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            raise ExtractError("Claude返回的内容不是合法JSON") from None
+        after = "".join(b.text for b in blocks[cut + 1:] if b.type == "text")
+        whole = "".join(b.text for b in blocks if b.type == "text")
+        for text in dict.fromkeys((after, whole)):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                continue
+        raise ExtractError("Claude返回的内容不是合法JSON")
+
+
+# ---- 解析结果 ----
+
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_QUOTE_NOISE = re.compile(r"[\s⏎「」『』“”\"'‘’]+")
 
 
 def _due(value) -> str:
     s = str(value or "").strip()
+    if not _DATE.fullmatch(s):
+        return UNSET
     try:
-        date.fromisoformat(s)
-        return s
+        return date.fromisoformat(s).isoformat()
     except ValueError:
         return UNSET
 
 
-def parse_result(data, refs: dict[str, Message]) -> tuple[str, list[Item]]:
+def _norm_id(value) -> str:
+    s = re.sub(r"[\s\[\]［］()（）]", "", str(value)).lower()
+    return f"m{s}" if s.isdigit() else s
+
+
+def _quote_found(quote: str, texts: list[str]) -> bool:
+    """原话（允许用…省略中间）能在所引消息里找到。"""
+    parts = [p for p in re.split(r"…+|\.{3,}", _QUOTE_NOISE.sub("", quote)) if p]
+    hay = [_QUOTE_NOISE.sub("", t) for t in texts]
+    return bool(parts) and any(all(p in h for p in parts) for h in hay)
+
+
+def _is_nothing(summary: str) -> bool:
+    return re.sub(r"[\s。.！!]", "", summary) in ("", NOTHING)
+
+
+def parse_result(data, refs: dict[str, Message], texts: dict[str, str] | None = None) -> tuple[str, list[Item]]:
     if not isinstance(data, dict):
         raise ExtractError("Claude返回的结构不对")
-    summary = str(data.get("summary") or "").strip()
+    texts = texts or {}
+    summary = one_line(str(data.get("summary") or ""))
     items = []
     for raw in data.get("items") or []:
         if not isinstance(raw, dict) or not str(raw.get("task") or "").strip():
             continue
-        ids = [s for s in raw.get("source_ids") or [] if isinstance(s, str) and s in refs]
+        ids: list[str] = []
+        for s in raw.get("source_ids") or []:
+            ref = _norm_id(s)
+            if ref in refs and ref not in ids:
+                ids.append(ref)
+        quote = one_line(str(raw.get("quote") or ""))
+        quote_ok = bool(ids) and _quote_found(quote, [texts.get(i, "") for i in ids]) if texts else bool(ids)
         confidence = raw.get("confidence") if raw.get("confidence") in LEVELS else "中"
         items.append(Item(
             kind=raw.get("kind") if raw.get("kind") in KINDS else "待办",
-            task=str(raw["task"]).strip(),
-            owner=str(raw.get("owner") or UNSET).strip(),
+            task=one_line(str(raw["task"])),
+            owner=one_line(str(raw.get("owner") or UNSET)),
             due=_due(raw.get("due")),
-            due_text=str(raw.get("due_text") or UNSET).strip(),
-            quote=str(raw.get("quote") or "").strip(),
+            due_text=one_line(str(raw.get("due_text") or UNSET)),
+            quote=quote,
             source_ids=ids,
-            confidence=confidence if ids else "低",  # 编号对不上原文的，一律降为低
+            confidence=confidence if quote_ok else "低",  # 出处或原话对不上的，一律降为低
+            quote_ok=quote_ok,
         ))
     return summary, items
 
 
 # ---- 写笔记 ----
+
+
+def _inline(s: str) -> str:
+    return escape_inline(one_line(s))
 
 
 def _due_label(it: Item) -> str:
@@ -285,36 +402,43 @@ def _due_label(it: Item) -> str:
 
 
 def _evidence(it: Item, r: ChatActions, writer: VaultWriter) -> str:
-    quote = f"原话：「{escape_inline(it.quote)}」" if it.quote else "原话：未摘录"
-    links = [writer.message_link(r.chat, r.refs[s]) for s in it.source_ids[:3]]
-    return quote + (" ".join(links) if links else "（出处未核实）")
+    label = "原话" if it.quote_ok else "原话（和原文对不上，请核对）"
+    quote = f"{label}：「{_inline(it.quote)}」" if it.quote else "原话：未摘录"
+    return quote + " ".join(writer.message_link(r.chat, r.refs[s]) for s in it.source_ids[:3])
 
 
 def render_chat_section(r: ChatActions, writer: VaultWriter) -> list[str]:
-    lines = ["", f"## [[{writer.note_title(r.chat)}]]"]
-    if r.summary:
-        lines += ["", f"要点：{escape_inline(r.summary)}"]
-    todo = [it for it in r.items if it.kind != "决定"]
-    decided = [it for it in r.items if it.kind == "决定"]
+    lines = ["", f"## {writer.chat_link(r.chat)}"]
+    if r.summary and not _is_nothing(r.summary):
+        lines += ["", f"要点：{_inline(r.summary)}"]
+    sourced = [it for it in r.items if it.source_ids]
+    todo = [it for it in sourced if it.kind != "决定"]
+    decided = [it for it in sourced if it.kind == "决定"]
+    unsourced = [it for it in r.items if not it.source_ids]
     if todo:
         lines.append("")
         for it in todo:
             due = f" 📅 {it.due}" if it.due != UNSET else ""  # Obsidian Tasks插件认这个格式
-            lines.append(f"- [ ] {escape_inline(it.task)}{due}")
-            lines.append(f"    - {it.kind} · 责任方：{escape_inline(it.owner)} · 截止：{escape_inline(_due_label(it))} · 置信度：{it.confidence}")
+            lines.append(f"- [ ] {_inline(it.task)}{due}")
+            lines.append(f"    - {it.kind} · 责任方：{_inline(it.owner)} · 截止：{_inline(_due_label(it))} · 置信度：{it.confidence}")
             lines.append(f"    - {_evidence(it, r, writer)}")
     if decided:
         lines += ["", "**已定事项**", ""]
         for it in decided:
-            lines.append(f"- {escape_inline(it.task)}")
+            lines.append(f"- {_inline(it.task)}")
             lines.append(f"    - {_evidence(it, r, writer)}")
+    if unsourced:  # 编号对不上原文的，不列成任务，免得混进任务清单
+        lines += ["", "**待核实**（找不到对应的原文消息）", ""]
+        for it in unsourced:
+            lines.append(f"- {it.kind}：{_inline(it.task)}")
+            lines.append(f"    - 原话：「{_inline(it.quote)}」" if it.quote else "    - 原话：未摘录")
     return lines
 
 
 def write_actions_note(writer: VaultWriter, results: list[ChatActions], start: datetime, end: datetime,
                        now: datetime, tz: tzinfo) -> Path | None:
-    useful = [r for r in results if not r.error and (r.items or (r.summary and r.summary != "无实质内容"))]
-    failed = [r for r in results if r.error]
+    useful = [r for r in results if r.items or (r.summary and not _is_nothing(r.summary))]
+    failed = [r for r in results if r.error or r.skipped_note]
     if not useful and not failed:
         return None
     s, e = start.astimezone(tz), end.astimezone(tz)
@@ -324,7 +448,7 @@ def write_actions_note(writer: VaultWriter, results: list[ChatActions], start: d
         body += render_chat_section(r, writer)
     if failed:
         body += ["", "## 未处理", ""]
-        body += [f"- [[{writer.note_title(r.chat)}]]：{escape_inline(r.error)}" for r in failed]
+        body += [f"- {writer.chat_link(r.chat)}：{_inline(r.skipped_note or r.error)}" for r in failed]
 
     day = now.astimezone(tz).date()
     path = writer.root / ACTIONS_DIR / f"{day:%Y-%m-%d}行动项.md"
@@ -349,17 +473,20 @@ def write_actions_note(writer: VaultWriter, results: list[ChatActions], start: d
     return path
 
 
-@dataclass
-class Batch:
-    """一个会话这次要处理的消息。"""
-    chat: Chat
-    msgs: list[Message]
-    start: datetime
+def _fence(text: str) -> str:
+    """代码块围栏要比内容里最长的一串反引号还长，否则内容会把它截断。"""
+    best = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        best = max(best, run)
+    return "`" * max(3, best + 1)
 
 
 def write_prompt_bundle(writer: VaultWriter, batches: list[Batch], end: datetime, now: datetime, tz: tzinfo,
                         *, mask: bool, context: str) -> Path:
     local_now = now.astimezone(tz)
+    rules = system_prompt(context, manual=True)
+    rules_fence = _fence(rules)  # 要求里有「- [ ]」示例，放进代码块，免得在库里变成一条假任务
     parts = [
         f"# 微信行动项提示词 · {local_now:%Y-%m-%d %H:%M}",
         "",
@@ -367,17 +494,18 @@ def write_prompt_bundle(writer: VaultWriter, batches: list[Batch], end: datetime
         "",
         "## 要求",
         "",
-        system_prompt(context, manual=True),
+        rules_fence + "text",
+        rules,
+        rules_fence,
         "",
-        f"今天：{day_heading(local_now.date())}。每条记录前的 [m数字] 是消息编号；「我」是用户本人。",
+        f"今天：{day_heading(local_now.date())}。每条记录前的[m数字]是消息编号；「我」是用户本人。",
     ]
     for b in batches:
-        transcript, _ = build_transcript(b.msgs, tz, mask=mask)
-        # 代码块围栏要比内容里最长的一串反引号还长，否则聊天内容会把它截断
-        fence = "`" * max(3, _longest_backticks(transcript) + 1)
+        transcript, _, _ = build_transcript(b.msgs, tz, mask=mask)
+        fence = _fence(transcript)
         parts += [
             "",
-            f"## 会话：{b.chat.name}（{b.chat.kind}）",
+            f"## 会话：{_chat_name(b.chat, mask)}（{b.chat.kind}）",
             "",
             f"范围：{b.start.astimezone(tz):%Y-%m-%d %H:%M}至{end.astimezone(tz):%Y-%m-%d %H:%M}",
             "",
@@ -385,17 +513,9 @@ def write_prompt_bundle(writer: VaultWriter, batches: list[Batch], end: datetime
             transcript,
             fence,
         ]
-    path = writer.root / ACTIONS_DIR / "提示词" / f"{local_now:%Y-%m-%d %H%M}提示词.md"
+    path = writer.root / ACTIONS_DIR / "提示词" / f"{local_now:%Y-%m-%d %H%M%S}提示词.md"
     write_if_changed(path, "\n".join(parts) + "\n")
     return path
-
-
-def _longest_backticks(text: str) -> int:
-    best = run = 0
-    for ch in text:
-        run = run + 1 if ch == "`" else 0
-        best = max(best, run)
-    return best
 
 
 # ---- 主流程 ----
@@ -414,17 +534,25 @@ def run_actions(
     client=None,
     log: Callable[[str], None] = print,
     now: datetime | None = None,
-) -> Path | None:
+) -> ActionsResult:
     """进度按会话记：每个会话记住处理到了哪条消息，下次只看它后面的。
 
-    这样电脑上的微信没开着时跑了一次、之后才同步进来的消息也不会漏；处理失败的会话进度不前进，
-    下次自动重试。指定了--until的算补看历史，不动日常进度。
+    - 电脑上的微信没开着时跑了一次、之后才同步进来的消息不会漏；处理失败的会话进度不前进，下次重试，
+      同一段连续失败MAX_FAILURES次后跳过并在笔记里写明。
+    - --since晚于某个会话的进度（中间有一段没处理过），或者指定了--until，都只算补看，不动日常进度。
     """
     tz = cfg.tz
     now = now or datetime.now(tz)
     end = min(until, now) if until else now
     today = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     default_start = today - timedelta(days=cfg.ai.default_days - 1)
+    if until is not None and since is None:  # 只给了结束日期：往前看default_days天
+        since = until - timedelta(days=cfg.ai.default_days)
+    lock = threading.Lock()
+
+    def say(text: str) -> None:
+        with lock:  # 几个线程同时打印时别串行
+            log(text)
 
     batches: list[Batch] = []
     for chat in chats:
@@ -442,76 +570,116 @@ def run_actions(
             continue
         msgs = [m for m in source.fetch(chat, start, end)
                 if not m.is_system and (after is None or (m.time, m.seq) > after)]
-        if msgs:
-            batches.append(Batch(chat, msgs, start))
-
-    def advance(done: list[Batch]) -> None:
-        if until is None:
-            for b in done:
-                _advance(state, b, tz)
-        state.save()
+        if not msgs:
+            continue
+        advance = until is None and (since is None or since <= (cursor or default_start))
+        if all(_is_placeholder(m) for m in msgs):  # 只有图片、表情之类，没什么可提取的
+            if advance:
+                _advance(state, chat, msgs[-1], tz)
+            continue
+        batches.append(Batch(chat, msgs, start, advance))
 
     if not batches:
-        log("没有新消息需要处理。")
-        return None
+        state.save()
+        say("没有新消息需要处理。")
+        return ActionsResult()
     first = min(b.start for b in batches)
-    log(f"{first.astimezone(tz):%Y-%m-%d %H:%M}起：{len(batches)}个会话、"
-        f"{sum(len(b.msgs) for b in batches)}条消息")
+    say(f"{first.astimezone(tz):%Y-%m-%d %H:%M}起：{len(batches)}个会话、{sum(len(b.msgs) for b in batches)}条消息")
 
-    if prompt_only:
+    if prompt_only:  # 生成提示词也算处理过：进度往前推
         path = write_prompt_bundle(writer, batches, end, now, tz, mask=cfg.ai.mask, context=cfg.ai.context)
-        advance(batches)
-        return path
+        for b in batches:
+            if b.advance:
+                _advance(state, b.chat, b.msgs[-1], tz)
+        state.save()
+        return ActionsResult(path=path, processed=len(batches))
 
     extractor = ClaudeExtractor(cfg.ai.model, cfg.ai.effort, cfg.ai.context, client)
+    stop = threading.Event()
     fatal: list[FatalAPIError] = []
 
     def process(b: Batch) -> ChatActions:
         r = ChatActions(b.chat)
-        if fatal:
-            r.error = "已跳过（前面出现了致命错误）"
+        if stop.is_set():
+            r.error, r.fatal = "已跳过（前面出现了致命错误）", True
             return r
         try:
             index = 1
             for chunk in chunk_messages(b.msgs, cfg.ai.max_chars_per_request):
-                transcript, refs = build_transcript(chunk, tz, mask=cfg.ai.mask, start_index=index)
+                transcript, refs, texts = build_transcript(chunk, tz, mask=cfg.ai.mask, start_index=index)
                 index += len(refs)
-                data = extractor.extract(build_user_prompt(b.chat, transcript, b.start, end, now, tz))
-                summary, items = parse_result(data, refs)
+                try:
+                    prompt = build_user_prompt(b.chat, transcript, b.start, end, now, tz, mask=cfg.ai.mask)
+                    summary, items = parse_result(extractor.extract(prompt), refs, texts)
+                except ExtractError as e:  # 前面几段的结果保留，从失败的这段起下次重来
+                    r.error, r.failed_chunk = str(e), chunk
+                    break
                 r.refs.update(refs)
                 r.items += items
-                if summary and summary != "无实质内容":
+                r.done = chunk[-1]
+                if not _is_nothing(summary):
                     r.summary = f"{r.summary} {summary}".strip()
-            log(f"  {b.chat.name}：{len(r.items)}条")
         except FatalAPIError as e:
             fatal.append(e)
-            r.error = str(e)
-        except ExtractError as e:
-            r.error = str(e)
-            log(f"  {b.chat.name}：{e}")
+            stop.set()
+            r.error, r.fatal = str(e), True
+        except Exception as e:  # 意外错误只算这个会话失败，别的会话照常
+            r.error = f"意外错误：{type(e).__name__}: {e}"
+        say(f"  {b.chat.name}：{r.error or f'{len(r.items)}条'}")
         return r
 
-    with ThreadPoolExecutor(max_workers=cfg.ai.concurrency) as pool:
-        results = list(pool.map(process, batches))
+    pool = ThreadPoolExecutor(max_workers=cfg.ai.concurrency)
+    futures = [pool.submit(process, b) for b in batches]
+    interrupted = False
+    try:
+        for _ in as_completed(futures):
+            pass
+    except KeyboardInterrupt:  # 按了Ctrl+C：已经做完的照样写笔记、记进度
+        interrupted = True
+        stop.set()
+    finally:
+        pool.shutdown(wait=not interrupted, cancel_futures=True)
+    results = [f.result() if f.done() and not f.cancelled() else
+               ChatActions(b.chat, error="已中断，没处理完", fatal=True) for b, f in zip(batches, futures)]
+
+    for b, r in zip(batches, results):
+        if not b.advance:
+            continue
+        st = state.chat(b.chat.id)
+        if r.done is not None:
+            _advance(state, b.chat, r.done, tz)
+        if r.failed_chunk:
+            st["actions_failures"] = st.get("actions_failures", 0) + 1
+            if st["actions_failures"] >= MAX_FAILURES:
+                chunk = r.failed_chunk
+                _advance(state, b.chat, chunk[-1], tz)
+                st.pop("actions_failures", None)
+                r.skipped_note = (
+                    f"同一段记录连续{MAX_FAILURES}次失败（{r.error}），已跳过"
+                    f"{chunk[0].time.astimezone(tz):%m-%d %H:%M}至{chunk[-1].time.astimezone(tz):%m-%d %H:%M}"
+                    f"的{len(chunk)}条消息。需要的话用actions --chat加--since、--until单独补看"
+                )
+        elif not r.error:
+            st.pop("actions_failures", None)
 
     path = write_actions_note(writer, results, first, end, now, tz)
-    log(f"Claude用量：输入{extractor.input_tokens:,} token，输出{extractor.output_tokens:,} token")
-    # 已经处理好的会话照样记进度；出错的下次重来
-    advance([b for b, r in zip(batches, results) if not r.error])
+    say(f"Claude用量：输入{extractor.input_tokens:,} token，输出{extractor.output_tokens:,} token")
+    state.save()  # 笔记写好以后才存进度：笔记写失败的话，下次整批重来
+    if interrupted:
+        raise KeyboardInterrupt
     if fatal:
         raise fatal[0]
-    return path
+    return ActionsResult(path=path, processed=len(batches), failed=sum(1 for r in results if r.error))
 
 
 def _cursor(st: dict, tz: tzinfo) -> tuple[datetime | None, int]:
     return parse_time(st.get("actions_until"), tz), int(st.get("actions_seq") or 0)
 
 
-def _advance(state: State, b: Batch, tz: tzinfo) -> None:
-    """记下这个会话处理到了哪条消息，只往前推。"""
-    st = state.chat(b.chat.id)
-    newest = b.msgs[-1]
+def _advance(state: State, chat: Chat, newest: Message, tz: tzinfo) -> None:
+    """记下这个会话处理到了哪条消息，只往前推。保留小数秒，否则带毫秒的最后一条每次都会重发。"""
+    st = state.chat(chat.id)
     cursor, cursor_seq = _cursor(st, tz)
     if cursor is None or (newest.time, newest.seq) > (cursor, cursor_seq):
-        st["actions_until"] = newest.time.astimezone(tz).isoformat(timespec="seconds")
+        st["actions_until"] = newest.time.astimezone(tz).isoformat()
         st["actions_seq"] = newest.seq

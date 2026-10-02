@@ -23,6 +23,10 @@ class Source:
         """会话列表里没有、但用户直接给了ID时用。不支持就返回None。"""
         return None
 
+    def take_warnings(self) -> list[str]:
+        """读数据时攒下的提醒（比如跳过了认不出时间的行），取走后清空。"""
+        return []
+
     def data_start(self) -> datetime | None:
         """整个数据最早从什么时候开始（粗到年即可），用来省掉全量导出时的空查询。"""
         return None

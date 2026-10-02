@@ -6,7 +6,7 @@ import argparse
 import os
 import sys
 from datetime import date, datetime, timedelta
-from fnmatch import fnmatchcase
+from pathlib import Path
 
 from . import __version__
 from .actions import FatalAPIError, run_actions
@@ -14,7 +14,7 @@ from .config import Config, ConfigError, load_config
 from .exporter import ChatResult, export_chats
 from .model import Chat, is_noise_chat
 from .obsidian import VaultWriter
-from .privacy import matches
+from .privacy import is_glob, matches, name_matches
 from .sources import Source, SourceError, open_source
 from .state import State, StateError
 
@@ -59,17 +59,18 @@ def _ambiguous(token: str, found: list[Chat]) -> str:
 
 
 def _resolve_one(token: str, chats: list[Chat], source: Source) -> list[Chat]:
-    exact = [c for c in chats if c.id == token] or [c for c in chats if c.name == token]
+    exact = ([c for c in chats if token in (c.id, c.name)]
+             or [c for c in chats if name_matches(token, c.id, c.name) and not is_glob(token)])
     if len(exact) == 1:
         return exact
     if len(exact) > 1:
         raise UsageError(_ambiguous(token, exact))
-    if any(ch in token for ch in "*?["):  # 通配：匹配到几个算几个
-        found = [c for c in chats if fnmatchcase(c.name, token) or fnmatchcase(c.id, token)]
+    if is_glob(token):  # 通配（只认*和?）：匹配到几个算几个
+        found = [c for c in chats if name_matches(token, c.id, c.name)]
         if found:
             return found
         raise UsageError(f"「{token}」没有匹配到任何会话")
-    found = [c for c in chats if token in c.name]
+    found = [c for c in chats if token.casefold() in c.name.casefold()]
     if len(found) == 1:
         return found
     if len(found) > 1:
@@ -81,8 +82,14 @@ def _resolve_one(token: str, chats: list[Chat], source: Source) -> list[Chat]:
     raise UsageError(f"没找到会话「{token}」，先用list命令查一下名字或ID")
 
 
+def _warn(source: Source) -> None:
+    for w in source.take_warnings():
+        print(f"提醒：{w}")
+
+
 def select_chats(cfg: Config, source: Source, tokens: list[str], use_all: bool, for_ai: bool) -> list[Chat]:
     chats = source.list_chats()
+    _warn(source)
 
     def blocked(c: Chat) -> str:
         if matches(cfg.export.exclude, c):
@@ -120,7 +127,7 @@ def _open(cfg: Config) -> tuple[Source, State, VaultWriter]:
         raise ConfigError(f"Obsidian库不存在：{cfg.vault}（检查obsidian.vault）")
     source = open_source(cfg)
     state = State.for_root(cfg.root)
-    return source, state, VaultWriter(cfg.root, cfg.tz, state)
+    return source, state, VaultWriter(cfg.root, cfg.tz, state, link_prefix=Path(cfg.obsidian.folder).as_posix())
 
 
 def _report(results: list[ChatResult]) -> None:
@@ -168,7 +175,9 @@ def cmd_doctor(cfg: Config, args) -> int:
 
 
 def cmd_list(cfg: Config, args) -> int:
-    chats = open_source(cfg).list_chats()
+    source = open_source(cfg)
+    chats = source.list_chats()
+    _warn(source)
     if not args.all:
         chats = [c for c in chats if not is_noise_chat(c.id)]
     if args.groups:
@@ -199,7 +208,7 @@ def cmd_export(cfg: Config, args) -> int:
     mode = "全量重导" if args.full else ("按时间段导出（按月对齐）" if since or until else "增量导出")
     print(f"{mode}：{len(chats)}个会话 → {cfg.root}")
     results = export_chats(source, writer, state, chats, tz=cfg.tz, floor=_floor(cfg),
-                           since=since, until=until, full=args.full)
+                           since=since, until=until, full=args.full, force=args.force)
     _report(results)
     return 1 if any(r.error for r in results) else 0
 
@@ -208,10 +217,10 @@ def cmd_actions(cfg: Config, args) -> int:
     since, until = _window(args, cfg.tz)
     source, state, writer = _open(cfg)
     chats = select_chats(cfg, source, args.chat, False, for_ai=True)
-    path = run_actions(cfg, source, state, writer, chats, since=since, until=until, prompt_only=args.prompt_only)
-    if path:
-        print(f"已写入：{path}")
-    return 0
+    result = run_actions(cfg, source, state, writer, chats, since=since, until=until, prompt_only=args.prompt_only)
+    if result.path:
+        print(f"已写入：{result.path}")
+    return 1 if result.failed else 0
 
 
 def cmd_run(cfg: Config, args) -> int:
@@ -222,10 +231,10 @@ def cmd_run(cfg: Config, args) -> int:
     _report(results)
     print("② 提取行动项")
     ai_chats = [c for c in chats if not matches(cfg.ai.exclude, c)]
-    path = run_actions(cfg, source, state, writer, ai_chats, prompt_only=args.prompt_only)
-    if path:
-        print(f"已写入：{path}")
-    return 1 if any(r.error for r in results) else 0
+    result = run_actions(cfg, source, state, writer, ai_chats, prompt_only=args.prompt_only)
+    if result.path:
+        print(f"已写入：{result.path}")
+    return 1 if result.failed or any(r.error for r in results) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -256,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(ex)
     ex.add_argument("--all", action="store_true", help="忽略export.include，导出全部会话")
     ex.add_argument("--full", action="store_true", help="忽略进度，从头重导")
+    ex.add_argument("--force", action="store_true", help="新取到的消息比归档里少时也覆盖（默认不覆盖）")
     ex.set_defaults(func=cmd_export)
 
     ac = sub.add_parser("actions", help="提取行动项（默认从上次处理到现在）")
@@ -285,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(cfg, args)
     except (ConfigError, SourceError, StateError, UsageError, FatalAPIError) as e:
         print(f"出错：{e}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as e:  # 文件被占用、磁盘满、编码认不出之类
+        print(f"出错：文件读写失败（{type(e).__name__}）：{e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\n已中断。做完的会话进度已保存，下次运行会接着来。", file=sys.stderr)

@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import anthropic
 import pytest
 
-from wxexport.actions import FALLBACK_BETA, MAX_TOKENS, ClaudeExtractor, FatalAPIError
+from wxexport.actions import FALLBACK_BETA, MAX_TOKENS, ClaudeExtractor, ExtractError, FatalAPIError
 
 RESULT = {"summary": "约了明天开会。", "items": [
     {"kind": "决定", "task": "明天上午十点开会", "owner": "张总", "due": "2026-10-03", "due_text": "明天",
@@ -15,7 +15,7 @@ RESULT = {"summary": "约了明天开会。", "items": [
 
 
 class MockMessagesAPI:
-    def __init__(self, status=200):
+    def __init__(self, status=200, drop_midway=False):
         self.requests = []
         mock = self
 
@@ -57,6 +57,12 @@ class MockMessagesAPI:
                                   for name, data in events).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                if drop_midway:  # 代理抖动：流写到一半连接断了
+                    self.send_header("Content-Length", str(len(payload) + 1000))
+                    self.end_headers()
+                    self.wfile.write(payload[: len(payload) // 2])
+                    self.close_connection = True
+                    return
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -111,3 +117,23 @@ def test_connection_error_is_fatal():
     client = anthropic.Anthropic(api_key="k", base_url="http://127.0.0.1:9", max_retries=0)
     with pytest.raises(FatalAPIError, match="HTTPS_PROXY"):
         ClaudeExtractor("claude-opus-5-5", "medium", client=client).extract("x")
+
+
+def test_stream_dropped_midway_fails_only_that_request():
+    mock = MockMessagesAPI(drop_midway=True)
+    try:
+        client = anthropic.Anthropic(api_key="k", base_url=mock.url, max_retries=0)
+        with pytest.raises(ExtractError, match="网络中断"):
+            ClaudeExtractor("claude-opus-5-5", "medium", client=client).extract("x")
+    finally:
+        mock.close()
+
+
+def test_missing_key_is_reported_clearly(monkeypatch, tmp_path):
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+    with pytest.raises(FatalAPIError, match="没有找到Claude API密钥"):
+        ClaudeExtractor("claude-opus-5-5", "medium").extract("x")

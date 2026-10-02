@@ -30,6 +30,7 @@ class MockChatlog:
         self.messages: dict[str, list[dict]] = {}
         self.coverage = (t("2025-01-01 00:00"), t("2027-01-01 00:00"))  # 有数据库分片覆盖的时间段
         self.requests: list[tuple[str, dict]] = []
+        self.truncate: set[str] = set()  # 这些会话的消息响应写一半就断开
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -93,6 +94,14 @@ class MockChatlog:
                     msgs = [m for m in mock.messages.get(q["talker"], [])
                             if start <= datetime.fromisoformat(m["time"]) < end]
                     msgs.sort(key=lambda m: m["seq"])
+                    if q["talker"] in mock.truncate:
+                        body = json.dumps(msgs).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body) + 500))
+                        self.end_headers()
+                        self.wfile.write(body[: len(body) // 2])
+                        self.close_connection = True
+                        return
                     if q.get("limit"):
                         off = int(q.get("offset", 0))
                         msgs = msgs[off: off + int(q["limit"])]

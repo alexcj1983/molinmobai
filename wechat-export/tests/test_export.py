@@ -1,11 +1,13 @@
 from datetime import date, datetime
 
+import pytest
+
 from conftest import GROUP, NOW, ZHANG, t
 from wxexport.cli import select_chats
 from wxexport.exporter import export_chats
 from wxexport.model import day_heading
 from wxexport.obsidian import VaultWriter
-from wxexport.sources import open_source
+from wxexport.sources import SourceError, open_source
 from wxexport.state import State
 
 
@@ -48,10 +50,12 @@ def test_full_export_layout_and_content(chatlog, make_config):
     assert "> 王经理 2026-09-29 18:00：合同草稿周三前发过来" in oct_
 
     note = read(group_dir / "项目群A.md")
-    assert "[[项目群A（2026-10）|10月]] · [[项目群A（2026-09）|9月]]" in note
+    g = "微信记录/聊天/群聊/项目群A/项目群A"   # 链接都带库内路径，库里有同名笔记也不会串
+    assert f"[[{g}（2026-10）|10月]] · [[{g}（2026-09）|9月]]" in note
+    assert f"批注请写在[[{g}|项目群A]]。" in sep
     assert "- 最近一条：2026-10-01 14:10" in note
     index = read(root / "微信记录索引.md")
-    assert "| [[项目群A]] | 2026-10-01 14:10 | 2 |" in index
+    assert f"| [[{g}\\|项目群A]] | 2026-10-01 14:10 | 2 |" in index
     assert state.chat(GROUP)["last_time"] == "2026-10-01T14:10:00+08:00"
 
 
@@ -125,3 +129,108 @@ def test_foreign_note_with_same_name_is_not_taken(chatlog, make_config):
     _, state = run_export(cfg)
     assert state.chat(GROUP)["folder"] != "聊天/群聊/项目群A"
     assert read(own / "项目群A.md") == "# 我自己的笔记\n"
+
+
+def test_month_is_not_shrunk_unless_forced(chatlog, make_config):
+    cfg = make_config(source={"base_url": chatlog.url})
+    run_export(cfg)
+    sep_file = cfg.root / "聊天" / "群聊" / "项目群A" / "项目群A（2026-09）.md"
+    # 微信里删了9月的一条（或换了电脑、清了存储），再按9月重导：默认不让归档缩水
+    chatlog.messages[GROUP] = [m for m in chatlog.messages[GROUP] if m["seq"] != 1002]
+    results, _ = run_export(cfg, since=datetime(2026, 9, 1, tzinfo=cfg.tz))
+    group = next(r for r in results if r.chat.id == GROUP)
+    assert group.months_kept == ["2026-09"] and "messages: 5" in read(sep_file)
+    results, _ = run_export(cfg, since=datetime(2026, 9, 1, tzinfo=cfg.tz), force=True)
+    assert "messages: 4" in read(sep_file)
+
+
+def test_orphan_begin_marker_does_not_eat_notes(chatlog, make_config):
+    cfg = make_config(source={"base_url": chatlog.url})
+    run_export(cfg)
+    note = cfg.root / "聊天" / "群聊" / "项目群A" / "项目群A.md"
+    # 用户在编辑模式里把自动区的结束标记删掉了，又在下面写了批注
+    text = read(note).replace("<!-- wxexport:end -->", "") + "我的批注：别丢\n"
+    note.write_text(text, encoding="utf-8")
+    for n, when in ((1008, "2026-10-02 05:00"), (1009, "2026-10-02 06:00")):  # 连着两次有新消息的导出
+        chatlog.add(GROUP, when, n, ZHANG, "张总", f"第{n}条")
+        chatlog.sessions[0]["nTime"] = t(when).isoformat()
+        run_export(cfg)
+    assert "我的批注：别丢" in read(note)
+
+
+def test_one_failing_chat_does_not_stop_the_batch(chatlog, make_config, monkeypatch):
+    cfg = make_config(source={"base_url": chatlog.url})
+    source = open_source(cfg)
+    real_fetch = source.fetch
+
+    def flaky(chat, start, end):
+        if chat.id == GROUP:
+            raise SourceError("/api/v1/chatlog返回HTTP 500：database is locked")
+        return real_fetch(chat, start, end)
+
+    monkeypatch.setattr(source, "fetch", flaky)
+    state = State.for_root(cfg.root)
+    writer = VaultWriter(cfg.root, cfg.tz, state)
+    chats = select_chats(cfg, source, [], False, for_ai=False)
+    results = export_chats(source, writer, state, chats, tz=cfg.tz, now=NOW, log=lambda s: None)
+    by_id = {r.chat.id: r for r in results}
+    assert "database is locked" in by_id[GROUP].error
+    assert by_id[ZHANG].messages == 2  # 后面的会话照常导出
+    assert "last_time" not in state.chat(GROUP)
+
+    def broken(chat, start, end):
+        raise SourceError("连不上")
+
+    monkeypatch.setattr(source, "fetch", broken)
+    with pytest.raises(SourceError, match="连续3个会话出错"):
+        export_chats(source, writer, State.for_root(cfg.root / "x"), chats * 2, tz=cfg.tz, now=NOW,
+                     log=lambda s: None)
+
+
+def test_progress_not_advanced_when_chat_note_fails(chatlog, make_config, monkeypatch):
+    cfg = make_config(source={"base_url": chatlog.url})
+    source = open_source(cfg)
+    state = State.for_root(cfg.root)
+    writer = VaultWriter(cfg.root, cfg.tz, state)
+
+    def locked(chat):
+        raise PermissionError("被同步盘占用")
+
+    monkeypatch.setattr(writer, "update_chat_note", locked)
+    chats = [c for c in source.list_chats() if c.id == GROUP]
+    results = export_chats(source, writer, state, chats, tz=cfg.tz, now=NOW, log=lambda s: None)
+    assert "被同步盘占用" in results[0].error
+    assert "last_time" not in state.chat(GROUP)  # 下次会整段重来，会话页能补上
+
+
+def test_same_name_group_and_private_get_distinct_names(chatlog, make_config):
+    chatlog.rooms.append({"name": "200@chatroom", "owner": ZHANG, "users": [], "remark": "张总", "nickName": ""})
+    chatlog.sessions.append({"userName": "200@chatroom", "nickName": "", "nTime": t("2026-10-01 07:00").isoformat()})
+    chatlog.add("200@chatroom", "2026-10-01 07:00", 7001, ZHANG, "张总", "对接群消息")
+    cfg = make_config(source={"base_url": chatlog.url})
+    _, state = run_export(cfg)
+    names = {state.chat(ZHANG)["folder"], state.chat("200@chatroom")["folder"]}
+    assert names == {"聊天/私聊/张总", "聊天/群聊/张总（200）"}
+
+
+def test_lost_state_and_renamed_chat_reuses_folder_and_months(chatlog, make_config):
+    cfg = make_config(source={"base_url": chatlog.url})
+    run_export(cfg)
+    (cfg.root / ".wxexport-state.json").unlink()
+    chatlog.rooms[0]["nickName"] = "项目群A-已结项"            # 群改了名
+    chatlog.messages[GROUP] = [m for m in chatlog.messages[GROUP] if m["seq"] >= 1006]  # 早期记录已经没了
+    _, state = run_export(cfg)
+    assert state.chat(GROUP)["folder"] == "聊天/群聊/项目群A"     # 按wechat_id认回原目录
+    assert state.chat(GROUP)["months"] == ["2026-09", "2026-10"]  # 旧月份的链接还在
+    assert not (cfg.root / "聊天" / "群聊" / "项目群A-已结项").exists()
+
+
+def test_unnamed_group_uses_member_names(chatlog, make_config):
+    chatlog.rooms.append({"name": "300@chatroom", "owner": ZHANG, "remark": "", "nickName": "",
+                          "users": [{"userName": ZHANG, "displayName": ""}, {"userName": "wxid_li", "displayName": "李工"},
+                                    {"userName": "wxid_family", "displayName": ""}, {"userName": "wxid_x", "displayName": "老王"}]})
+    chatlog.sessions.append({"userName": "300@chatroom", "nickName": "王经理", "nTime": t("2026-10-01 07:00").isoformat()})
+    chatlog.add("300@chatroom", "2026-10-01 07:00", 8001, ZHANG, "张总", "大家好")
+    cfg = make_config(source={"base_url": chatlog.url})
+    _, state = run_export(cfg)
+    assert state.chat("300@chatroom")["folder"] == "聊天/群聊/张总、李工、家里等"  # 不用最后发言人「王经理」

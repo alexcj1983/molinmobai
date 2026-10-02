@@ -23,7 +23,8 @@ def atomic_write_text(path: Path, text: str) -> None:
     # 临时文件以点开头，Obsidian不会去索引它
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        # errors="replace"：导入数据里偶尔有孤立的代理字符（半个emoji），换成问号，别让整批导出失败
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="\n") as f:
             f.write(text)
         # Windows上文件被同步盘或杀毒软件短暂占用时replace会失败，重试几次
         for attempt in range(5):

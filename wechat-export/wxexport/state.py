@@ -20,7 +20,7 @@ class State:
         self.data: dict = {"version": 1, "chats": {}, "actions": {}}
         if path.exists():
             try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
+                loaded = json.loads(path.read_text(encoding="utf-8-sig"))  # 用记事本改过会带BOM
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 raise StateError(
                     f"进度文件损坏：{path}（{e}）。删掉它会从头重新导出，已有的笔记不受影响。"

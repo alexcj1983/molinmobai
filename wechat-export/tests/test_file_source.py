@@ -75,3 +75,48 @@ def test_export_from_files(tmp_path):
     export_chats(src, VaultWriter(root, SH, state), state, src.list_chats(), tz=SH, now=NOW, log=lambda s: None)
     text = (root / "聊天" / "私聊" / "张总" / "张总（2026-09）.md").read_text(encoding="utf-8")
     assert "**10:23 张总**：下周交保函" in text
+
+
+def test_duplicates_kept_within_file_and_removed_across_files(tmp_path):
+    rows = ("Time,SenderName,Sender,TalkerName,Talker,Content\n"
+            "2026-09-30 10:23:00,张总,wxid_zhang,张总,wxid_zhang,好的\n"
+            "2026-09-30 10:23:00,张总,wxid_zhang,张总,wxid_zhang,好的\n"
+            "2026-09-30 10:23:00,张总,wxid_zhang,张总,wxid_zhang,![图片](http://127.0.0.1:5030/image/a)\n"
+            "2026-09-30 10:23:00,张总,wxid_zhang,张总,wxid_zhang,![图片](http://127.0.0.1:5030/image/b)\n")
+    (tmp_path / "a.csv").write_text(rows, encoding="utf-8")
+    (tmp_path / "b.csv").write_text(rows, encoding="utf-8")  # 另一份时间段重叠的导出
+    src = FileSource(str(tmp_path), SH)
+    [chat] = src.list_chats()
+    assert not chat.is_group  # 有真实微信ID时按ID判断，私聊不会因为两个人说话被当成群
+    msgs = src.fetch(chat, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 10, 1, tzinfo=SH))
+    assert [m.text for m in msgs] == ["好的", "好的", "[图片]", "[图片]"]
+
+
+def test_json_with_seq_is_deduped_by_seq(tmp_path):
+    raw = [{"seq": i, "time": "2026-09-30T10:23:00+08:00", "talker": "wxid_zhang", "sender": "wxid_zhang",
+            "senderName": "张总", "type": 3} for i in (1, 2, 3)]
+    (tmp_path / "a.json").write_text(json.dumps(raw), encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps(raw), encoding="utf-8")
+    src = FileSource(str(tmp_path), SH)
+    [chat] = src.list_chats()
+    assert len(src.fetch(chat, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 10, 1, tzinfo=SH))) == 3
+
+
+def test_excel_times_parsed_and_bad_rows_reported(tmp_path):
+    (tmp_path / "x.csv").write_text(
+        "Time,SenderName,Sender,TalkerName,Talker,Content\n"
+        "2026/9/3 9:05,张总,wxid_zhang,张总,wxid_zhang,早\n"
+        "九月三号,张总,wxid_zhang,张总,wxid_zhang,坏行\n"
+        "2026/9/3 14:30,张总,wxid_zhang,张总,wxid_zhang,[语音](http://127.0.0.1:5030/voice/x)\n",
+        encoding="utf-8")
+    src = FileSource(str(tmp_path), SH)
+    [chat] = src.list_chats()
+    msgs = src.fetch(chat, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 10, 1, tzinfo=SH))
+    assert [m.text for m in msgs] == ["早", "[语音]"]
+    [warning] = src.take_warnings()
+    assert "1行时间认不出来" in warning and "九月三号" in warning
+
+
+def test_file_id_colon_does_not_reach_folder_name(tmp_path):
+    from wxexport.obsidian import _id_tail
+    assert ":" not in _id_tail("file:老王") and len(_id_tail("file:老王")) >= 2

@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from .fsutil import read_text
+
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 SOURCE_TYPES = ("chatlog_api", "file")
 
@@ -132,7 +134,9 @@ def load_config(path: Path | str | None = None) -> Config:
             f"找不到配置文件{path}。把config.example.yaml复制一份改名为config.yaml，按注释填好再运行。"
         )
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        raw = yaml.safe_load(read_text(path)) or {}  # 记事本存成ANSI（GBK）也能读
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path}的编码认不出来，请用UTF-8重新保存") from None
     except yaml.YAMLError as e:
         raise ConfigError(
             f"{path}格式有误：{e}\n提示：Windows路径请用正斜杠（D:/Obsidian/库），或用单引号括起来。"

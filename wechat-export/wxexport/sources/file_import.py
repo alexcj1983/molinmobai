@@ -31,9 +31,10 @@ DEFAULT_COLUMNS = {
     "is_self": "",
 }
 
-# chatlog文本格式里的图片、文件等是指向本地服务的链接，服务一关就失效，换成占位文字
-_MEDIA_LINK = re.compile(r"!\[(图片|视频|动画表情)\]\([^)]*\)")
-_LABEL_LINK = re.compile(r"\[(链接|文件|小程序|视频号|音乐)\|([^\]]*)\]\(([^)]*)\)")
+# chatlog文本格式里的图片、语音、文件等是指向本地服务的链接，服务一关就失效，换成占位文字
+_MEDIA_LINK = re.compile(r"!?\[(图片|视频|动画表情|语音)\]\([^)]*\)")
+_LABEL_LINK = re.compile(r"\[(链接|文件|小程序|视频号|音乐)\|(.*?)\]\(([^)\s]*)\)")
+_TRANSFER = re.compile(r"\[转账\|([^\]]*)\](?:\(([^)]*)\))?")
 _LOCAL_URL = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?/", re.I)
 
 
@@ -45,7 +46,10 @@ def _clean_markup(text: str) -> str:
         keep_url = url.startswith(("http://", "https://")) and not _LOCAL_URL.match(url)
         return " ".join(x for x in (f"[{m.group(1)}]", m.group(2).strip(), url if keep_url else "") if x)
 
-    return _LABEL_LINK.sub(label, text)
+    def transfer(m: re.Match) -> str:
+        return " ".join(x for x in ("[转账]", m.group(1).strip(), f"备注：{m.group(2)}" if m.group(2) else "") if x)
+
+    return _TRANSFER.sub(transfer, _LABEL_LINK.sub(label, text))
 
 
 def _truthy(v) -> bool:
@@ -63,6 +67,7 @@ class FileSource(Source):
         self.self_ids = set(self_ids)
         self._messages: dict[str, list[Message]] | None = None
         self._names: dict[str, str] = {}
+        self._warnings: list[str] = []
 
     def _files(self) -> list[Path]:
         if not self.path:
@@ -80,9 +85,17 @@ class FileSource(Source):
         seen: set = set()
         for f in self._files():
             loader = self._load_json if f.suffix.lower() == ".json" else self._load_csv
+            # 几份导出时间段有重叠时去重：有seq按seq；没有的按「同一秒、同一人、同样内容在本文件里第几次出现」，
+            # 这样同一文件里连发的几张图、几句「好的」都保留，跨文件的重复才去掉
+            occurrence: dict = {}
             for m in loader(f):
-                key = (m.chat_id, m.time, m.sender_id or m.sender, m.text)
-                if key in seen:  # 几份导出时间段有重叠时去重
+                if m.seq:
+                    key = (m.chat_id, "seq", m.seq)
+                else:
+                    base = (m.chat_id, m.time, m.sender_id or m.sender, m.text)
+                    occurrence[base] = occurrence.get(base, 0) + 1
+                    key = (*base, occurrence[base])
+                if key in seen:
                     continue
                 seen.add(key)
                 by_chat[m.chat_id].append(m)
@@ -128,9 +141,13 @@ class FileSource(Source):
             return str(row.get(name) or "").strip() if name else ""
 
         fallback_id = "file:" + f.stem
+        bad = 0
         for row in reader:
             t = parse_time(cell(row, "time"), self.tz)
             if t is None:
+                bad += 1
+                if bad == 1:
+                    first_bad = cell(row, "time")
                 continue
             chat_name, chat_id = cell(row, "chat"), cell(row, "chat_id")
             if not chat_id:
@@ -147,18 +164,29 @@ class FileSource(Source):
                 is_self=is_self,
                 sender_id=sender_id,
             )
+        if bad:
+            self._warnings.append(f"{f.name}：有{bad}行时间认不出来，已跳过（例：「{first_bad}」）")
 
     def check(self) -> str:
         files = self._files()
         msgs = self._load()
         return f"读到{len(files)}个文件、{len(msgs)}个会话、{sum(len(v) for v in msgs.values())}条消息"
 
+    def take_warnings(self) -> list[str]:
+        self._load()
+        out, self._warnings = self._warnings, []
+        return out
+
     def list_chats(self) -> list[Chat]:
         chats = []
         for cid, msgs in self._load().items():
-            others = {m.sender_id or m.sender for m in msgs if not m.is_self and not m.is_system}
-            chats.append(Chat(cid, self._names.get(cid) or cid, is_group_id(cid) or len(others) > 1,
-                              msgs[-1].time if msgs else None))
+            if cid.startswith("file:"):
+                # 没有微信ID时只能猜：认不出「我」的情况下私聊也有两个发言人，所以三人以上才算群聊
+                others = {m.sender_id or m.sender for m in msgs if not m.is_self and not m.is_system}
+                is_group = len(others) > 2
+            else:
+                is_group = is_group_id(cid)
+            chats.append(Chat(cid, self._names.get(cid) or cid, is_group, msgs[-1].time if msgs else None))
         return chats
 
     def data_start(self) -> datetime | None:

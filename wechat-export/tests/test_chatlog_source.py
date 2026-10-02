@@ -69,7 +69,8 @@ def test_long_range_is_split_into_windows(chatlog):
 
 
 def test_data_start_probe(chatlog):
-    assert source(chatlog).data_start() == datetime(2025, 1, 1, tzinfo=SH)
+    # 第一个有分片的年份是2025，往前留一个月余量
+    assert source(chatlog).data_start() == datetime(2024, 12, 1, tzinfo=SH)
 
 
 def test_unreachable_service():
@@ -82,3 +83,31 @@ def test_wrong_service_path(chatlog):
     src = ChatlogAPISource(chatlog.url + "/wrong", SH, timeout=3)
     with pytest.raises(SourceError):
         src.list_chats()
+
+
+def test_truncated_response_is_a_source_error(chatlog):
+    chatlog.truncate.add(GROUP)
+    src = source(chatlog)
+    group = next(c for c in src.list_chats() if c.id == GROUP)
+    with pytest.raises(SourceError, match="中途断开"):
+        src.fetch(group, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 10, 1, tzinfo=SH))
+
+
+def test_quote_of_own_message_and_transfer(chatlog):
+    chatlog.add(GROUP, "2026-09-30 12:00", 1011, ZHANG, "张总", "收到", mtype=49, sub=57,
+                contents={"refer": {"type": 1, "sender": "wxid_me", "senderName": "陈", "content": "额度确认过了"}})
+    chatlog.add(GROUP, "2026-09-30 12:05", 1012, ZHANG, "张总", "[转账|发送 ￥200.00](午饭钱)", mtype=49, sub=2000)
+    src = source(chatlog)
+    group = next(c for c in src.list_chats() if c.id == GROUP)
+    msgs = {m.seq: m for m in src.fetch(group, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 10, 1, tzinfo=SH))}
+    assert msgs[1011].quote_sender == "我"  # 从自己发过的消息认出自己的ID
+    assert msgs[1012].text == "[转账] 发送 ￥200.00 备注：午饭钱"
+
+
+def test_same_second_messages_without_seq_are_kept(chatlog):
+    for _ in range(3):  # Mac版微信3.x没有seq，同一秒连发三张图
+        chatlog.add(ZHANG, "2026-09-30 09:00", 0, ZHANG, "张总", mtype=3)
+    src = source(chatlog)
+    zhang = next(c for c in src.list_chats() if c.id == ZHANG)
+    msgs = src.fetch(zhang, datetime(2026, 9, 1, tzinfo=SH), datetime(2026, 12, 1, tzinfo=SH))
+    assert sum(1 for m in msgs if m.text == "[图片]") == 3

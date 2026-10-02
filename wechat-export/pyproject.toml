@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wxexport"
 version = "0.1.0"
-description = "微信聊天记录归档到 Obsidian，并用 Claude 提取行动项"
+description = "微信聊天记录归档到Obsidian，并用Claude提取行动项"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=1.11,<2",
     "pyyaml>=6",
+    "socksio>=1",  # 代理设成socks5://时需要
     "tzdata; sys_platform == 'win32'",
 ]
 

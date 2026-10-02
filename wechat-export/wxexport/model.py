@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 WEEKDAYS = "一二三四五六日"
 
@@ -43,6 +43,7 @@ class Message:
     seq: int = 0
     sender_id: str = ""
     quote_sender: str = ""           # 引用回复：被引用的人
+    quote_sender_id: str = ""
     quote: str = ""                  # 引用回复：被引用的内容（单行）
     details: list[str] = field(default_factory=list)  # 合并转发、群公告等展开后的条目
 
@@ -66,30 +67,64 @@ def one_line(text: str, limit: int = 0) -> str:
     return s
 
 
-_FRACTION = re.compile(r"\.(\d+)(?=([+-]\d{2}:?\d{2})?$)")
+# 年月日之间可以是 - / . 或「年月日」，月日时可以不补零（Excel另存过的CSV常见「2026/9/30 9:30」），
+# 小数秒位数不限，时区写成Z、+08:00或+0800都行
+_DT = re.compile(
+    r"^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?"
+    r"(?:[ T]+(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:[.,](\d+))?)?)?"
+    r"\s*(Z|z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def _from_ts(ts: float) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_text(s: str) -> datetime | None:
+    m = _DT.match(s)
+    if not m:
+        return None
+    y, mo, d, hh, mi, ss, frac, off = m.groups()
+    try:
+        dt = datetime(int(y), int(mo), int(d), int(hh or 0), int(mi or 0), int(ss or 0),
+                      int((frac or "0")[:6].ljust(6, "0")))
+    except ValueError:
+        return None
+    if off:
+        if off in ("Z", "z"):
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            sign = -1 if off[0] == "-" else 1
+            dt = dt.replace(tzinfo=timezone(sign * timedelta(hours=int(off[1:3]), minutes=int(off[-2:]))))
+    return dt
 
 
 def parse_time(value, default_tz: tzinfo) -> datetime | None:
-    """解析ISO 8601、'YYYY-MM-DD HH:MM[:SS]'、10位或13位时间戳。不带时区的按default_tz理解。"""
-    if value is None or value == "":
+    """解析各种常见时间写法和10位、13位时间戳。不带时区的按default_tz理解，解析不了返回None。"""
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
         dt = value
-    elif isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
-        ts = float(value)
-        if ts > 1e12:  # 13位毫秒时间戳
-            ts /= 1000
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    elif isinstance(value, (int, float)):
+        dt = _from_ts(value / 1000 if value > 1e12 else value)
     else:
-        s = str(value).strip().replace("/", "-")
-        if s[-1:] in ("Z", "z"):
-            s = s[:-1] + "+00:00"
-        # Python 3.10的fromisoformat只认3位或6位小数秒，Go输出的位数不固定
-        s = _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
-        try:
-            dt = datetime.fromisoformat(s)
-        except ValueError:
-            return None
+        s = str(value).strip()
+        if s.isdigit():
+            if len(s) == 10:
+                dt = _from_ts(int(s))
+            elif len(s) == 13:
+                dt = _from_ts(int(s) / 1000)
+            elif len(s) == 14:  # 20260930102300
+                dt = _parse_text(f"{s[:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:]}")
+            else:
+                return None
+        else:
+            dt = _parse_text(s)
+    if dt is None:
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=default_tz)
     if dt.year < 2000:  # Go的零值时间是0001-01-01

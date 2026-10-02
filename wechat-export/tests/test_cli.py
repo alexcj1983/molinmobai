@@ -71,3 +71,21 @@ def test_actions_prompt_only_and_run(chatlog, make_config, capsys):
     assert "已写入：" in out and "提示词" in out
     assert main(["-c", path, "run", "--prompt-only"]) == 0
     assert "① 增量导出" in capsys.readouterr().out
+
+
+def test_exact_name_with_brackets_is_not_a_wildcard(chatlog, make_config, capsys):
+    chatlog.rooms.append({"name": "400@chatroom", "owner": "x", "users": [], "remark": "[内部]财务群", "nickName": ""})
+    chatlog.sessions.append({"userName": "400@chatroom", "nickName": "", "nTime": t("2026-09-30 10:00").isoformat()})
+    chatlog.add("400@chatroom", "2026-09-30 10:00", 9001, "x", "会计", "报销单已交")
+    path = cfg_path(make_config, chatlog, export={"exclude": ["[内部]财务群"]})
+    assert main(["-c", path, "export", "--chat", "[内部]财务群"]) == 0
+    assert "跳过「[内部]财务群」：在export.exclude里" in capsys.readouterr().out
+
+
+def test_file_source_warnings_are_printed(make_config, tmp_path, capsys):
+    data = tmp_path / "导出"
+    data.mkdir()
+    (data / "x.csv").write_text("Time,SenderName,Sender,TalkerName,Talker,Content\n坏时间,a,b,c,d,e\n", encoding="utf-8")
+    path = str(make_config(source={"type": "file", "path": data.as_posix()}).path)
+    assert main(["-c", path, "list"]) == 0
+    assert "提醒：x.csv：有1行时间认不出来" in capsys.readouterr().out
