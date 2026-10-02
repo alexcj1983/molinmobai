@@ -1,0 +1,48 @@
+# wxexport配置。复制本文件为config.yaml再改；config.yaml在.gitignore里，不会被提交。
+# Windows路径请用正斜杠（D:/Obsidian/我的库），或者用单引号括起来。
+
+source:
+  # 数据从哪来：
+  #   chatlog_api  chatlog兼容的本地接口
+  #   file         其他工具导出的JSON / CSV文件
+  type: chatlog_api
+  base_url: http://127.0.0.1:5030
+  timeout: 120                 # 单次请求最长等几秒，大群全量导出可以调大
+
+  # type: file时用这几项：
+  # path: D:/微信导出            # 文件或文件夹
+  # file_timezone: Asia/Shanghai # 文件里的时间不带时区时按这个理解，默认同obsidian.timezone
+  # csv_columns:                 # CSV列名和下面不一样时改成实际列名，没有的列写 ""
+  #   time: Time
+  #   sender: SenderName
+  #   sender_id: Sender
+  #   chat: TalkerName
+  #   chat_id: Talker
+  #   content: Content
+  #   is_self: ""
+
+  # 你自己的微信号或昵称，用来认出“我”发的消息。数据源本身能认出来时不用填。
+  self_ids: []
+
+obsidian:
+  vault: D:/Obsidian/我的库     # Obsidian库所在的文件夹
+  folder: 微信记录              # 库里放聊天记录的文件夹，没有会自动建
+  timezone: Asia/Shanghai       # 归档统一用这个时区。人在国外也建议固定，免得记录跟着电脑时区跳
+
+export:
+  # since: 2024-01-01           # 最早导出到哪天；不写 = 全部历史
+  include: []                   # 只导出这些会话（空 = 全部）。可写名字、ID或通配，如 "*项目*"
+  exclude: []                   # 永远不导出的会话，私人会话放这里
+  groups: true                  # 导出群聊
+  private: true                 # 导出私聊
+  skip_official_accounts: true  # 跳过公众号和微信系统账号
+
+ai:
+  model: claude-opus-5-5
+  effort: medium                # low / medium / high / xhigh / max，越高越细，也越贵
+  context: ""                   # 一句话介绍工作背景，帮Claude看懂行话，例："我做海外电力工程项目的商务和项目管理"
+  exclude: []                   # 导出到Obsidian、但不发给Claude的会话
+  mask: true                    # 发给Claude前，把手机号、身份证号、银行卡号、邮箱换成占位符
+  default_days: 7               # 第一次提取行动项时往前看几天
+  max_chars_per_request: 150000 # 单个会话太长时按这个字数切段
+  concurrency: 4                # 同时处理几个会话

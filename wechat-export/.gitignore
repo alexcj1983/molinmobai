@@ -1,0 +1,14 @@
+# 个人配置和进度：里面有会话名、路径，不提交
+config.yaml
+*.local.yaml
+.wxexport-state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/

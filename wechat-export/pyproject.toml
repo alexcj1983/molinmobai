@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wxexport"
+version = "0.1.0"
+description = "微信聊天记录归档到 Obsidian，并用 Claude 提取行动项"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.11,<2",
+    "pyyaml>=6",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+wxexport = "wxexport.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wxexport*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
