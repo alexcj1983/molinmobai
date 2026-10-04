@@ -12,7 +12,7 @@ def test_doctor_ok(chatlog, make_config, capsys, monkeypatch):
     assert main(["-c", cfg_path(make_config, chatlog), "doctor"]) == 0
     out = capsys.readouterr().out
     assert "✓ 归档目录可写" in out and "✓ 数据接口正常" in out and "共4个会话" in out
-    assert "没检测到ANTHROPIC_API_KEY" in out
+    assert "prompt——只生成提示词" in out  # 默认后端什么都不出电脑
 
 
 def test_doctor_reports_dead_source(make_config, capsys):

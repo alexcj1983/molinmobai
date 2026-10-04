@@ -92,6 +92,7 @@ def setup(cfg):
 
 
 def run(cfg, client, **kw):
+    cfg.ai.backend = "claude"  # 这些用例测的是云端集成；默认后端是prompt
     source, state, writer, chats = setup(cfg)
     if "since" not in kw:
         kw["since"] = datetime(2026, 9, 1, tzinfo=cfg.tz)

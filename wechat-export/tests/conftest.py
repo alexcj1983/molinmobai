@@ -151,6 +151,61 @@ def load_sample(mock: MockChatlog) -> None:
     mock.add("wxid_family", "2026-09-20 20:00", 3001, "wxid_family", "家里", "周末回来吃饭")
 
 
+class MockOllama:
+    """模拟Ollama：POST /api/chat 回一段canned内容，GET /api/tags 回模型列表。"""
+
+    def __init__(self, content='{"summary":"","items":[]}', models=("qwen2.5:7b",)):
+        self.content = content
+        self.models = list(models)
+        self.chat_requests: list[dict] = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _handler(self):
+        mock = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _json(self, code, obj):
+                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/api/tags"):
+                    return self._json(200, {"models": [{"name": n} for n in mock.models]})
+                return self._json(404, {"error": "not found"})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                mock.chat_requests.append(body)
+                content = mock.content(body) if callable(mock.content) else mock.content
+                return self._json(200, {"message": {"role": "assistant", "content": content},
+                                        "prompt_eval_count": 123, "eval_count": 45})
+
+        return Handler
+
+
+@pytest.fixture
+def ollama():
+    m = MockOllama()
+    yield m
+    m.close()
+
+
 @pytest.fixture
 def chatlog():
     mock = MockChatlog()

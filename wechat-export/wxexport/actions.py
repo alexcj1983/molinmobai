@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 import threading
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
@@ -224,7 +226,26 @@ def build_user_prompt(chat: Chat, transcript: str, start: datetime, end: datetim
 # ---- 调用Claude ----
 
 
+_FENCE = re.compile(r"^```[a-zA-Z0-9]*\n?|\n?```$")
+_JSON_OBJ = re.compile(r"\{.*\}", re.S)
+
+
+def loads_lenient(text: str) -> dict:
+    """本地模型偶尔会在JSON外面包一层```或说明文字，尽量把里面的对象抠出来。"""
+    text = _FENCE.sub("", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = _JSON_OBJ.search(text)
+        if m is None:
+            raise
+        return json.loads(m.group())
+
+
 class ClaudeExtractor:
+    sends_out = True  # 把聊天内容发到境外
+    label = "Claude（云端）"
+
     def __init__(self, model: str, effort: str, context: str = "", client=None):
         if client is None:
             import anthropic
@@ -321,6 +342,94 @@ class ClaudeExtractor:
             except json.JSONDecodeError:
                 continue
         raise ExtractError("Claude返回的内容不是合法JSON")
+
+
+# ---- 本地模型（Ollama） ----
+
+
+class LocalExtractor:
+    """本机跑的模型，默认Ollama（http://127.0.0.1:11434）。数据只在本机流转，不出电脑。"""
+
+    sends_out = False
+    label = "本地模型"
+
+    def __init__(self, base_url: str, model: str, context: str = "", num_ctx: int = 8192, timeout: float = 600.0):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.system = system_prompt(context)
+        self.num_ctx = num_ctx
+        self.timeout = timeout
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 本机不走代理
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self._lock = threading.Lock()
+
+    def _call(self, payload: dict, allow_fallback: bool) -> dict:
+        req = urllib.request.Request(
+            self.base_url + "/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            # 老版本Ollama不认JSON Schema，退回最朴素的format:"json"
+            if allow_fallback and e.code == 400 and "format" in detail.lower():
+                return self._call({**payload, "format": "json"}, allow_fallback=False)
+            if e.code == 404 or "not found" in detail.lower():
+                raise FatalAPIError(f"本地模型「{self.model}」没下载。先运行：ollama pull {self.model}") from None
+            raise ExtractError(f"本地模型出错（HTTP {e.code}）：{detail[:200]}") from None
+        except urllib.error.URLError as e:
+            raise FatalAPIError(
+                f"连不上本地模型服务（{self.base_url}）：{e.reason}。装了Ollama并在运行吗？（命令行跑 ollama serve）"
+            ) from None
+        except (TimeoutError, ConnectionError) as e:
+            raise ExtractError(
+                f"本地模型超时（{e}）。可以调小ai.max_chars_per_request，或调大ai.local_timeout"
+            ) from None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise ExtractError(f"本地模型服务返回的不是JSON，ai.local_url（{self.base_url}）对吗？") from None
+
+    def extract(self, user_prompt: str) -> dict:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "format": RESULT_SCHEMA,  # 让模型按结构输出；不认的话_call里会退回format:"json"
+            "options": {"temperature": 0, "num_ctx": self.num_ctx},
+        }
+        data = self._call(payload, allow_fallback=True)
+        with self._lock:
+            self.input_tokens += int(data.get("prompt_eval_count") or 0)
+            self.output_tokens += int(data.get("eval_count") or 0)
+        content = (data.get("message") or {}).get("content") or ""
+        try:
+            return loads_lenient(content)
+        except json.JSONDecodeError:
+            raise ExtractError(
+                "本地模型没按JSON格式回话，多半是模型太小或会话太长。"
+                "换更强的ai.local_model（如qwen2.5:14b），或调小ai.max_chars_per_request"
+            ) from None
+
+
+def make_extractor(cfg, client=None):
+    """按配置造一个提取器。两种提取器都有 extract(prompt)->dict、input_tokens、output_tokens、sends_out、max_chars。"""
+    if cfg.ai.backend == "local":
+        ext = LocalExtractor(cfg.ai.local_url, cfg.ai.local_model, cfg.ai.context,
+                             cfg.ai.local_num_ctx, cfg.ai.local_timeout)
+        # 本地模型上下文小，单段按num_ctx压一压，免得长会话被模型悄悄截断（约1 token≈1.5个汉字，留出系统提示和输出）
+        ext.max_chars = min(cfg.ai.max_chars_per_request, int(cfg.ai.local_num_ctx * 1.5))
+    else:
+        ext = ClaudeExtractor(cfg.ai.model, cfg.ai.effort, cfg.ai.context, client)
+        ext.max_chars = cfg.ai.max_chars_per_request
+    return ext
 
 
 # ---- 解析结果 ----
@@ -586,7 +695,7 @@ def run_actions(
     first = min(b.start for b in batches)
     say(f"{first.astimezone(tz):%Y-%m-%d %H:%M}起：{len(batches)}个会话、{sum(len(b.msgs) for b in batches)}条消息")
 
-    if prompt_only:  # 生成提示词也算处理过：进度往前推
+    if prompt_only or cfg.ai.backend == "prompt":  # 只生成提示词，不调任何模型；也算处理过，进度往前推
         path = write_prompt_bundle(writer, batches, end, now, tz, mask=cfg.ai.mask, context=cfg.ai.context)
         for b in batches:
             if b.advance:
@@ -594,7 +703,7 @@ def run_actions(
         state.save()
         return ActionsResult(path=path, processed=len(batches))
 
-    extractor = ClaudeExtractor(cfg.ai.model, cfg.ai.effort, cfg.ai.context, client)
+    extractor = make_extractor(cfg, client)
     stop = threading.Event()
     fatal: list[FatalAPIError] = []
 
@@ -605,7 +714,7 @@ def run_actions(
             return r
         try:
             index = 1
-            for chunk in chunk_messages(b.msgs, cfg.ai.max_chars_per_request):
+            for chunk in chunk_messages(b.msgs, extractor.max_chars):
                 transcript, refs, texts = build_transcript(chunk, tz, mask=cfg.ai.mask, start_index=index)
                 index += len(refs)
                 try:
@@ -663,7 +772,10 @@ def run_actions(
             st.pop("actions_failures", None)
 
     path = write_actions_note(writer, results, first, end, now, tz)
-    say(f"Claude用量：输入{extractor.input_tokens:,} token，输出{extractor.output_tokens:,} token")
+    if extractor.sends_out:
+        say(f"{extractor.label}用量：输入{extractor.input_tokens:,} token，输出{extractor.output_tokens:,} token")
+    else:
+        say(f"{extractor.label}（{extractor.model}）处理完毕，全程未出电脑")
     state.save()  # 笔记写好以后才存进度：笔记写失败的话，下次整批重来
     if interrupted:
         raise KeyboardInterrupt

@@ -38,11 +38,23 @@ export:
   skip_official_accounts: true  # 跳过公众号和微信系统账号
 
 ai:
-  model: claude-opus-5-5
-  effort: medium                # low / medium / high / xhigh / max，越高越细，也越贵
-  context: ""                   # 一句话介绍工作背景，帮Claude看懂行话，例："我做海外电力工程项目的商务和项目管理"
-  exclude: []                   # 导出到Obsidian、但不发给Claude的会话
-  mask: true                    # 发给Claude前，把手机号、身份证号、银行卡号、邮箱换成占位符
+  # 行动项交给谁处理，三选一：
+  #   prompt  只生成提示词文件，你自己贴给本机的Claude Code / Cowork或别的工具，什么都不出电脑（默认）
+  #   local   本机跑的模型（Ollama），自动出行动项，数据不出电脑
+  #   claude  云端Claude——会把聊天内容发到境外，默认不用；只在确认某些会话可以外发时开
+  backend: prompt
+  context: ""                   # 一句话工作背景，帮模型看懂行话，例："我做海外电力工程项目的商务和项目管理"
+  exclude: []                   # 导出到Obsidian、但不交给模型的会话
+  mask: true                    # 交给模型前，把手机号、身份证号、银行卡号、邮箱换成占位符
   default_days: 7               # 第一次提取行动项时往前看几天
   max_chars_per_request: 150000 # 单个会话太长时按这个字数切段
-  concurrency: 4                # 同时处理几个会话
+  concurrency: 4                # 同时处理几个会话；backend=local时建议设1（本机一次只跑得动一个模型）
+
+  # backend: local时用这几项
+  local_url: http://127.0.0.1:11434  # Ollama地址，只允许本机
+  local_model: qwen2.5:7b            # 先ollama pull下载；中文业务建议14b或32b，机器扛得住的话
+  local_num_ctx: 8192                # 模型一次能读多长，太小会把长会话截断
+
+  # backend: claude时用这几项（数据出电脑，慎用）
+  model: claude-opus-5-5
+  effort: medium                # low / medium / high / xhigh / max，越高越细，也越慢越贵

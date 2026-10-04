@@ -15,6 +15,8 @@ from .fsutil import read_text
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 SOURCE_TYPES = ("chatlog_api", "file")
+AI_BACKENDS = ("prompt", "local", "claude")
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 
 
 class ConfigError(Exception):
@@ -51,14 +53,23 @@ class ExportConfig:
 
 @dataclass
 class AIConfig:
-    model: str = "claude-opus-5-5"
-    effort: str = "medium"
+    # 行动项交给谁处理：prompt=只生成提示词文件（默认，什么都不外发）；
+    # local=本机模型Ollama（自动出，数据不出电脑）；claude=云端（会把聊天内容发到境外）
+    backend: str = "prompt"
     context: str = ""
     exclude: list = field(default_factory=list)
     mask: bool = True
     default_days: int = 7
     max_chars_per_request: int = 150_000
     concurrency: int = 4
+    # backend=local
+    local_url: str = "http://127.0.0.1:11434"
+    local_model: str = "qwen2.5:7b"
+    local_num_ctx: int = 8192
+    local_timeout: float = 600.0
+    # backend=claude
+    model: str = "claude-opus-5-5"
+    effort: str = "medium"
 
 
 @dataclass
@@ -183,8 +194,22 @@ def _validate(cfg: Config) -> None:
     cfg.export.exclude = _str_list(cfg.export.exclude, "export.exclude")
     cfg.ai.exclude = _str_list(cfg.ai.exclude, "ai.exclude")
 
+    if cfg.ai.backend not in AI_BACKENDS:
+        raise ConfigError(f"ai.backend只能是{' / '.join(AI_BACKENDS)}")
     if cfg.ai.effort not in EFFORTS:
         raise ConfigError(f"ai.effort只能是{' / '.join(EFFORTS)}")
+    if cfg.ai.backend == "local":
+        from urllib.parse import urlsplit
+
+        host = urlsplit(cfg.ai.local_url).hostname or ""
+        if host not in _LOCAL_HOSTS:
+            raise ConfigError(
+                f"ai.local_url只允许连本机（{host or cfg.ai.local_url}不是本机地址）——连别的机器数据就出电脑了"
+            )
+        if not str(cfg.ai.local_model).strip():
+            raise ConfigError("backend=local时要填ai.local_model，例：qwen2.5:7b")
+        if not isinstance(cfg.ai.local_num_ctx, int) or cfg.ai.local_num_ctx < 2048:
+            raise ConfigError("ai.local_num_ctx至少2048")
     if not isinstance(cfg.ai.default_days, int) or cfg.ai.default_days < 1:
         raise ConfigError("ai.default_days要写正整数")
     if not isinstance(cfg.ai.max_chars_per_request, int) or cfg.ai.max_chars_per_request < 5_000:

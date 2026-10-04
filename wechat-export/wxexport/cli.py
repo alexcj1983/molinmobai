@@ -164,14 +164,49 @@ def cmd_doctor(cfg: Config, args) -> int:
     except SourceError as e:
         ok = False
         print(f"✗ 数据源：{e}")
-    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-        print(f"✓ 已设置Claude API密钥（模型{cfg.ai.model}，effort {cfg.ai.effort}）")
+    ok = _check_backend(cfg) and ok
+    return 0 if ok else 1
+
+
+def _check_backend(cfg: Config) -> bool:
+    b = cfg.ai.backend
+    if b == "prompt":
+        print("· 行动项后端：prompt——只生成提示词文件，不调任何模型，什么都不出电脑")
+        return True
+    if b == "local":
+        try:
+            names = _ollama_models(cfg.ai.local_url, timeout=5)
+        except OSError as e:
+            print(f"✗ 行动项后端：local——连不上本地模型服务{cfg.ai.local_url}（{e}）。装了Ollama并在运行吗？")
+            return False
+        want = cfg.ai.local_model
+        if any(n == want or n.split(":")[0] == want.split(":")[0] for n in names):
+            print(f"✓ 行动项后端：local——{cfg.ai.local_url}，模型{want}已就绪，数据不出电脑")
+            return True
+        print(f"✗ 行动项后端：local——模型「{want}」还没下载。先运行：ollama pull {want}"
+              + (f"（已有：{'、'.join(names)}）" if names else ""))
+        return False
+    # claude
+    print("· 行动项后端：claude——⚠ 会把聊天内容发到境外Claude。只在你确认这些会话可以外发时用")
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    if has_key:
+        print(f"  ✓ 已设置Claude API密钥（模型{cfg.ai.model}，effort {cfg.ai.effort}）")
     else:
-        print("· 没检测到ANTHROPIC_API_KEY：调用Claude提取行动项需要它；只用--prompt-only可以不设")
+        print("  ✗ 没检测到ANTHROPIC_API_KEY（环境变量），调用会失败")
     proxy = next((os.environ[k] for k in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
                   if os.environ.get(k)), "")
-    print(f"· HTTPS代理：{proxy or '未设置'}（在中国大陆调用Claude API需要）")
-    return 0 if ok else 1
+    print(f"  · HTTPS代理：{proxy or '未设置'}（在中国大陆调用Claude API需要）")
+    return has_key
+
+
+def _ollama_models(base_url: str, timeout: float) -> list[str]:
+    import json
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 本机不走代理
+    with opener.open(base_url.rstrip("/") + "/api/tags", timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    return [str(m.get("name") or "") for m in (data.get("models") or []) if isinstance(m, dict)]
 
 
 def cmd_list(cfg: Config, args) -> int:
@@ -213,8 +248,16 @@ def cmd_export(cfg: Config, args) -> int:
     return 1 if any(r.error for r in results) else 0
 
 
+def _apply_backend(cfg: Config, args) -> None:
+    if getattr(args, "backend", None):
+        cfg.ai.backend = args.backend
+    if cfg.ai.backend == "claude" and not args.prompt_only:
+        print("⚠ 行动项用的是云端Claude，会把这些会话的内容发到境外。不想外发就用--prompt-only，或在配置里把ai.backend改成local")
+
+
 def cmd_actions(cfg: Config, args) -> int:
     since, until = _window(args, cfg.tz)
+    _apply_backend(cfg, args)
     source, state, writer = _open(cfg)
     chats = select_chats(cfg, source, args.chat, False, for_ai=True)
     result = run_actions(cfg, source, state, writer, chats, since=since, until=until, prompt_only=args.prompt_only)
@@ -224,6 +267,7 @@ def cmd_actions(cfg: Config, args) -> int:
 
 
 def cmd_run(cfg: Config, args) -> int:
+    _apply_backend(cfg, args)
     source, state, writer = _open(cfg)
     chats = select_chats(cfg, source, [], False, for_ai=False)
     print(f"① 增量导出：{len(chats)}个会话 → {cfg.root}")
@@ -268,12 +312,15 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--force", action="store_true", help="新取到的消息比归档里少时也覆盖（默认不覆盖）")
     ex.set_defaults(func=cmd_export)
 
+    backends = ("prompt", "local", "claude")
     ac = sub.add_parser("actions", help="提取行动项（默认从上次处理到现在）")
     add_common(ac)
-    ac.add_argument("--prompt-only", action="store_true", help="不调用API，只生成提示词文件")
+    ac.add_argument("--backend", choices=backends, help="临时指定后端，覆盖配置里的ai.backend")
+    ac.add_argument("--prompt-only", action="store_true", help="只生成提示词文件，不调任何模型")
     ac.set_defaults(func=cmd_actions)
 
     rn = sub.add_parser("run", help="日常一键：增量导出 + 提取行动项")
+    rn.add_argument("--backend", choices=backends, help="临时指定后端，覆盖配置里的ai.backend")
     rn.add_argument("--prompt-only", action="store_true", help="行动项这一步只生成提示词文件")
     rn.set_defaults(func=cmd_run)
     return p
